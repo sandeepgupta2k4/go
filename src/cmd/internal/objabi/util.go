@@ -24,6 +24,7 @@ var (
 	GOOS    = envOr("GOOS", defaultGOOS)
 	GO386   = envOr("GO386", defaultGO386)
 	GOARM   = goarm()
+	GOMIPS  = gomips()
 	Version = version
 )
 
@@ -41,12 +42,20 @@ func goarm() int {
 	panic("unreachable")
 }
 
+func gomips() string {
+	switch v := envOr("GOMIPS", defaultGOMIPS); v {
+	case "hardfloat", "softfloat":
+		return v
+	}
+	log.Fatalf("Invalid GOMIPS value. Must be hardfloat or softfloat.")
+	panic("unreachable")
+}
+
 func Getgoextlinkenabled() string {
 	return envOr("GO_EXTLINK_ENABLED", defaultGO_EXTLINK_ENABLED)
 }
 
 func init() {
-	framepointer_enabled = 1 // default
 	for _, f := range strings.Split(goexperiment, ",") {
 		if f != "" {
 			addexp(f)
@@ -80,7 +89,7 @@ func addexp(s string) {
 }
 
 var (
-	framepointer_enabled     int
+	framepointer_enabled     int = 1
 	Fieldtrack_enabled       int
 	Preemptibleloops_enabled int
 	Clobberdead_enabled      int
@@ -98,6 +107,12 @@ var exper = []struct {
 	{"framepointer", &framepointer_enabled},
 	{"preemptibleloops", &Preemptibleloops_enabled},
 	{"clobberdead", &Clobberdead_enabled},
+}
+
+var defaultExpstring = Expstring()
+
+func DefaultExpstring() string {
+	return defaultExpstring
 }
 
 func Expstring() string {

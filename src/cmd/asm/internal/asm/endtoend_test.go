@@ -19,6 +19,7 @@ import (
 
 	"cmd/asm/internal/lex"
 	"cmd/internal/obj"
+	"cmd/internal/objabi"
 )
 
 // An end-to-end test for the assembler: Do we print what we parse?
@@ -185,7 +186,7 @@ Diff:
 		t.Errorf(format, args...)
 		ok = false
 	}
-	obj.Flushplist(ctxt, pList, nil)
+	obj.Flushplist(ctxt, pList, nil, "")
 
 	for p := top; p != nil; p = p.Link {
 		if p.As == obj.ATEXT {
@@ -289,7 +290,7 @@ func testErrors(t *testing.T, goarch, file string) {
 		errBuf.WriteString(s)
 	}
 	pList.Firstpc, ok = parser.Parse()
-	obj.Flushplist(ctxt, pList, nil)
+	obj.Flushplist(ctxt, pList, nil, "")
 	if ok && !failed {
 		t.Errorf("asm: %s had no errors", goarch)
 	}
@@ -305,7 +306,7 @@ func testErrors(t *testing.T, goarch, file string) {
 			continue
 		}
 		fileline := m[1]
-		if errors[fileline] != "" {
+		if errors[fileline] != "" && errors[fileline] != line {
 			t.Errorf("multiple errors on %s:\n\t%s\n\t%s", fileline, errors[fileline], line)
 			continue
 		}
@@ -352,27 +353,36 @@ func testErrors(t *testing.T, goarch, file string) {
 }
 
 func Test386EndToEnd(t *testing.T) {
-	defer os.Setenv("GO386", os.Getenv("GO386"))
-
-	for _, go386 := range []string{"387", "sse"} {
-		os.Setenv("GO386", go386)
-		t.Logf("GO386=%v", os.Getenv("GO386"))
+	defer func(old string) { objabi.GO386 = old }(objabi.GO386)
+	for _, go386 := range []string{"387", "sse2"} {
+		t.Logf("GO386=%v", go386)
+		objabi.GO386 = go386
 		testEndToEnd(t, "386", "386")
 	}
 }
 
 func TestARMEndToEnd(t *testing.T) {
-	defer os.Setenv("GOARM", os.Getenv("GOARM"))
-
-	for _, goarm := range []string{"5", "6", "7"} {
-		os.Setenv("GOARM", goarm)
-		t.Logf("GOARM=%v", os.Getenv("GOARM"))
+	defer func(old int) { objabi.GOARM = old }(objabi.GOARM)
+	for _, goarm := range []int{5, 6, 7} {
+		t.Logf("GOARM=%d", goarm)
+		objabi.GOARM = goarm
 		testEndToEnd(t, "arm", "arm")
+		if goarm == 6 {
+			testEndToEnd(t, "arm", "armv6")
+		}
 	}
+}
+
+func TestARMErrors(t *testing.T) {
+	testErrors(t, "arm", "armerror")
 }
 
 func TestARM64EndToEnd(t *testing.T) {
 	testEndToEnd(t, "arm64", "arm64")
+}
+
+func TestARM64Encoder(t *testing.T) {
+	testEndToEnd(t, "arm64", "arm64enc")
 }
 
 func TestAMD64EndToEnd(t *testing.T) {
@@ -381,6 +391,7 @@ func TestAMD64EndToEnd(t *testing.T) {
 
 func TestAMD64Encoder(t *testing.T) {
 	testEndToEnd(t, "amd64", "amd64enc")
+	testEndToEnd(t, "amd64", "amd64enc_extra")
 }
 
 func TestAMD64Errors(t *testing.T) {

@@ -10,6 +10,7 @@ package os_test
 import (
 	"fmt"
 	"internal/testenv"
+	"io"
 	"io/ioutil"
 	"os"
 	osexec "os/exec"
@@ -17,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -185,4 +187,121 @@ func TestClosedPipeRaceRead(t *testing.T) {
 
 func TestClosedPipeRaceWrite(t *testing.T) {
 	testClosedPipeRace(t, false)
+}
+
+// Issue 20915: Reading on nonblocking fd should not return "waiting
+// for unsupported file type." Currently it returns EAGAIN; it is
+// possible that in the future it will simply wait for data.
+func TestReadNonblockingFd(t *testing.T) {
+	if os.Getenv("GO_WANT_READ_NONBLOCKING_FD") == "1" {
+		fd := int(os.Stdin.Fd())
+		syscall.SetNonblock(fd, true)
+		defer syscall.SetNonblock(fd, false)
+		_, err := os.Stdin.Read(make([]byte, 1))
+		if err != nil {
+			if perr, ok := err.(*os.PathError); !ok || perr.Err != syscall.EAGAIN {
+				t.Fatalf("read on nonblocking stdin got %q, should have gotten EAGAIN", err)
+			}
+		}
+		os.Exit(0)
+	}
+
+	testenv.MustHaveExec(t)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	cmd := osexec.Command(os.Args[0], "-test.run="+t.Name())
+	cmd.Env = append(os.Environ(), "GO_WANT_READ_NONBLOCKING_FD=1")
+	cmd.Stdin = r
+	output, err := cmd.CombinedOutput()
+	t.Logf("%s", output)
+	if err != nil {
+		t.Errorf("child process failed: %v", err)
+	}
+}
+
+func TestCloseWithBlockingReadByNewFile(t *testing.T) {
+	var p [2]int
+	err := syscall.Pipe(p[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	// os.NewFile returns a blocking mode file.
+	testCloseWithBlockingRead(t, os.NewFile(uintptr(p[0]), "reader"), os.NewFile(uintptr(p[1]), "writer"))
+}
+
+func TestCloseWithBlockingReadByFd(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Calling Fd will put the file into blocking mode.
+	_ = r.Fd()
+	testCloseWithBlockingRead(t, r, w)
+}
+
+// Test that we don't let a blocking read prevent a close.
+func testCloseWithBlockingRead(t *testing.T, r, w *os.File) {
+	defer r.Close()
+	defer w.Close()
+
+	c1, c2 := make(chan bool), make(chan bool)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func(c chan bool) {
+		defer wg.Done()
+		// Give the other goroutine a chance to enter the Read
+		// or Write call. This is sloppy but the test will
+		// pass even if we close before the read/write.
+		time.Sleep(20 * time.Millisecond)
+
+		if err := r.Close(); err != nil {
+			t.Error(err)
+		}
+		close(c)
+	}(c1)
+
+	wg.Add(1)
+	go func(c chan bool) {
+		defer wg.Done()
+		var b [1]byte
+		_, err := r.Read(b[:])
+		close(c)
+		if err == nil {
+			t.Error("I/O on closed pipe unexpectedly succeeded")
+		}
+		if err != io.EOF {
+			t.Errorf("got %v, expected io.EOF", err)
+		}
+	}(c2)
+
+	for c1 != nil || c2 != nil {
+		select {
+		case <-c1:
+			c1 = nil
+			// r.Close has completed, but the blocking Read
+			// is hanging. Close the writer to unblock it.
+			w.Close()
+		case <-c2:
+			c2 = nil
+		case <-time.After(1 * time.Second):
+			switch {
+			case c1 != nil && c2 != nil:
+				t.Error("timed out waiting for Read and Close")
+				w.Close()
+			case c1 != nil:
+				t.Error("timed out waiting for Close")
+			case c2 != nil:
+				t.Error("timed out waiting for Read")
+			default:
+				t.Error("impossible case")
+			}
+		}
+	}
+
+	wg.Wait()
 }

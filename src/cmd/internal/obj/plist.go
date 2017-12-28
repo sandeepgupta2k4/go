@@ -19,7 +19,7 @@ type Plist struct {
 // It is used to provide access to cached/bulk-allocated Progs to the assemblers.
 type ProgAlloc func() *Prog
 
-func Flushplist(ctxt *Link, plist *Plist, newprog ProgAlloc) {
+func Flushplist(ctxt *Link, plist *Plist, newprog ProgAlloc, myimportpath string) {
 	// Build list of symbols, and assign instructions to lists.
 	var curtext *LSym
 	var etext *Prog
@@ -106,7 +106,7 @@ func Flushplist(ctxt *Link, plist *Plist, newprog ProgAlloc) {
 		ctxt.Arch.Preprocess(ctxt, s, newprog)
 		ctxt.Arch.Assemble(ctxt, s, newprog)
 		linkpcln(ctxt, s)
-		ctxt.populateDWARF(plist.Curfn, s)
+		ctxt.populateDWARF(plist.Curfn, s, myimportpath)
 	}
 }
 
@@ -135,11 +135,18 @@ func (ctxt *Link) InitTextSym(s *LSym, flag int) {
 	s.Type = objabi.STEXT
 	ctxt.Text = append(ctxt.Text, s)
 
-	// Set up DWARF entry for s.
-	dsym := ctxt.dwarfSym(s)
-	dsym.Type = objabi.SDWARFINFO
-	dsym.Set(AttrDuplicateOK, s.DuplicateOK())
-	ctxt.Data = append(ctxt.Data, dsym)
+	// Set up DWARF entries for s.
+	info, loc, ranges, _ := ctxt.dwarfSym(s)
+	info.Type = objabi.SDWARFINFO
+	info.Set(AttrDuplicateOK, s.DuplicateOK())
+	if loc != nil {
+		loc.Type = objabi.SDWARFLOC
+		loc.Set(AttrDuplicateOK, s.DuplicateOK())
+		ctxt.Data = append(ctxt.Data, loc)
+	}
+	ranges.Type = objabi.SDWARFRANGE
+	ranges.Set(AttrDuplicateOK, s.DuplicateOK())
+	ctxt.Data = append(ctxt.Data, info, ranges)
 
 	// Set up the function's gcargs and gclocals.
 	// They will be filled in later if needed.

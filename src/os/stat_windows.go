@@ -16,9 +16,7 @@ func (file *File) Stat() (FileInfo, error) {
 	if file == nil {
 		return nil, ErrInvalid
 	}
-	if file == nil {
-		return nil, syscall.EINVAL
-	}
+
 	if file.isdir() {
 		// I don't know any better way to do that for directory
 		return Stat(file.dirinfo.path)
@@ -58,9 +56,8 @@ func (file *File) Stat() (FileInfo, error) {
 	}, nil
 }
 
-// Stat returns a FileInfo structure describing the named file.
-// If there is an error, it will be of type *PathError.
-func Stat(name string) (FileInfo, error) {
+// statNolog implements Stat for Windows.
+func statNolog(name string) (FileInfo, error) {
 	if len(name) == 0 {
 		return nil, &PathError{"Stat", name, syscall.Errno(syscall.ERROR_PATH_NOT_FOUND)}
 	}
@@ -71,7 +68,23 @@ func Stat(name string) (FileInfo, error) {
 	if err != nil {
 		return nil, &PathError{"Stat", name, err}
 	}
-
+	// Apparently (see https://golang.org/issues/19922#issuecomment-300031421)
+	// GetFileAttributesEx is fastest approach to get file info.
+	// It does not work for symlinks. But symlinks are rare,
+	// so try GetFileAttributesEx first.
+	var fs fileStat
+	err = syscall.GetFileAttributesEx(namep, syscall.GetFileExInfoStandard, (*byte)(unsafe.Pointer(&fs.sys)))
+	if err == nil && fs.sys.FileAttributes&syscall.FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+		fs.path = name
+		if !isAbs(fs.path) {
+			fs.path, err = syscall.FullPath(fs.path)
+			if err != nil {
+				return nil, &PathError{"FullPath", name, err}
+			}
+		}
+		fs.name = basename(name)
+		return &fs, nil
+	}
 	// Use Windows I/O manager to dereference the symbolic link, as per
 	// https://blogs.msdn.microsoft.com/oldnewthing/20100212-00/?p=14963/
 	h, err := syscall.CreateFile(namep, 0, 0, nil,
@@ -142,11 +155,8 @@ func statWithFindFirstFile(name string, namep *uint16) (FileInfo, error) {
 	}, nil
 }
 
-// Lstat returns the FileInfo structure describing the named file.
-// If the file is a symbolic link, the returned FileInfo
-// describes the symbolic link. Lstat makes no attempt to follow the link.
-// If there is an error, it will be of type *PathError.
-func Lstat(name string) (FileInfo, error) {
+// lstatNolog implements Lstat for Windows.
+func lstatNolog(name string) (FileInfo, error) {
 	if len(name) == 0 {
 		return nil, &PathError{"Lstat", name, syscall.Errno(syscall.ERROR_PATH_NOT_FOUND)}
 	}
@@ -170,7 +180,7 @@ func Lstat(name string) (FileInfo, error) {
 	if !isAbs(fs.path) {
 		fs.path, e = syscall.FullPath(fs.path)
 		if e != nil {
-			return nil, e
+			return nil, &PathError{"FullPath", name, e}
 		}
 	}
 	return fs, nil

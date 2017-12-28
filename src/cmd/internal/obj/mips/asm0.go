@@ -129,6 +129,7 @@ var optab = []Optab{
 	{AMOVWL, C_REG, C_NONE, C_SOREG, 7, 4, REGZERO, 0},
 	{AMOVVL, C_REG, C_NONE, C_SOREG, 7, 4, REGZERO, sys.MIPS64},
 	{ASC, C_REG, C_NONE, C_SOREG, 7, 4, REGZERO, 0},
+	{ASCV, C_REG, C_NONE, C_SOREG, 7, 4, REGZERO, sys.MIPS64},
 
 	{AMOVW, C_SEXT, C_NONE, C_REG, 8, 4, REGSB, sys.MIPS64},
 	{AMOVWU, C_SEXT, C_NONE, C_REG, 8, 4, REGSB, sys.MIPS64},
@@ -152,6 +153,7 @@ var optab = []Optab{
 	{AMOVWL, C_SOREG, C_NONE, C_REG, 8, 4, REGZERO, 0},
 	{AMOVVL, C_SOREG, C_NONE, C_REG, 8, 4, REGZERO, sys.MIPS64},
 	{ALL, C_SOREG, C_NONE, C_REG, 8, 4, REGZERO, 0},
+	{ALLV, C_SOREG, C_NONE, C_REG, 8, 4, REGZERO, sys.MIPS64},
 
 	{AMOVW, C_REG, C_NONE, C_LEXT, 35, 12, REGSB, sys.MIPS64},
 	{AMOVWU, C_REG, C_NONE, C_LEXT, 35, 12, REGSB, sys.MIPS64},
@@ -554,6 +556,11 @@ func (c *ctxt0) aclass(a *obj.Addr) int {
 			return C_LEXT
 
 		case obj.NAME_AUTO:
+			if a.Reg == REGSP {
+				// unset base register for better printing, since
+				// a.Offset is still relative to pseudo-SP.
+				a.Reg = obj.REG_NONE
+			}
 			c.instoffset = int64(c.autosize) + a.Offset
 			if c.instoffset >= -BIG && c.instoffset < BIG {
 				return C_SAUTO
@@ -561,6 +568,11 @@ func (c *ctxt0) aclass(a *obj.Addr) int {
 			return C_LAUTO
 
 		case obj.NAME_PARAM:
+			if a.Reg == REGSP {
+				// unset base register for better printing, since
+				// a.Offset is still relative to pseudo-FP.
+				a.Reg = obj.REG_NONE
+			}
 			c.instoffset = int64(c.autosize) + a.Offset + c.ctxt.FixedFrameSize()
 			if c.instoffset >= -BIG && c.instoffset < BIG {
 				return C_SAUTO
@@ -614,6 +626,11 @@ func (c *ctxt0) aclass(a *obj.Addr) int {
 			return C_LECON
 
 		case obj.NAME_AUTO:
+			if a.Reg == REGSP {
+				// unset base register for better printing, since
+				// a.Offset is still relative to pseudo-SP.
+				a.Reg = obj.REG_NONE
+			}
 			c.instoffset = int64(c.autosize) + a.Offset
 			if c.instoffset >= -BIG && c.instoffset < BIG {
 				return C_SACON
@@ -621,6 +638,11 @@ func (c *ctxt0) aclass(a *obj.Addr) int {
 			return C_LACON
 
 		case obj.NAME_PARAM:
+			if a.Reg == REGSP {
+				// unset base register for better printing, since
+				// a.Offset is still relative to pseudo-FP.
+				a.Reg = obj.REG_NONE
+			}
 			c.instoffset = int64(c.autosize) + a.Offset + c.ctxt.FixedFrameSize()
 			if c.instoffset >= -BIG && c.instoffset < BIG {
 				return C_SACON
@@ -871,6 +893,7 @@ func buildop(ctxt *obj.Link) {
 		switch r {
 		default:
 			ctxt.Diag("unknown op in build: %v", r)
+			ctxt.DiagFlush()
 			log.Fatalf("bad code")
 
 		case AABSF:
@@ -963,6 +986,7 @@ func buildop(ctxt *obj.Link) {
 
 		case ASYSCALL:
 			opset(ASYNC, r0)
+			opset(ANOOP, r0)
 			opset(ATLBP, r0)
 			opset(ATLBR, r0)
 			opset(ATLBWI, r0)
@@ -994,7 +1018,9 @@ func buildop(ctxt *obj.Link) {
 			AJMP,
 			AMOVWU,
 			ALL,
+			ALLV,
 			ASC,
+			ASCV,
 			AWORD,
 			obj.ANOP,
 			obj.ATEXT,
@@ -1741,6 +1767,8 @@ func (c *ctxt0) oprrr(a obj.As) uint32 {
 
 	case ASYNC:
 		return OP(1, 7)
+	case ANOOP:
+		return 0
 
 	case ACMOVN:
 		return OP(1, 3)
@@ -1913,8 +1941,12 @@ func (c *ctxt0) opirr(a obj.As) uint32 {
 		return OP(6, 6)
 	case -ALL:
 		return SP(6, 0)
+	case -ALLV:
+		return SP(6, 4)
 	case ASC:
 		return SP(7, 0)
+	case ASCV:
+		return SP(7, 4)
 	}
 
 	if a < 0 {

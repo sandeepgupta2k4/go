@@ -650,6 +650,12 @@ func TestEscape(t *testing.T) {
 			`<{{"script"}}>{{"doEvil()"}}</{{"script"}}>`,
 			`&lt;script>doEvil()&lt;/script>`,
 		},
+		{
+			"srcset bad URL in second position",
+			`<img srcset="{{"/not-an-image#,javascript:alert(1)"}}">`,
+			// The second URL is also filtered.
+			`<img srcset="/not-an-image#,#ZgotmplZ">`,
+		},
 	}
 
 	for _, test := range tests {
@@ -680,6 +686,40 @@ func TestEscape(t *testing.T) {
 		}
 		if tmpl.Tree != tmpl.text.Tree {
 			t.Errorf("%s: tree mismatch", test.name)
+			continue
+		}
+	}
+}
+
+func TestEscapeMap(t *testing.T) {
+	data := map[string]string{
+		"html":     `<h1>Hi!</h1>`,
+		"urlquery": `http://www.foo.com/index.html?title=main`,
+	}
+	for _, test := range [...]struct {
+		desc, input, output string
+	}{
+		// covering issue 20323
+		{
+			"field with predefined escaper name 1",
+			`{{.html | print}}`,
+			`&lt;h1&gt;Hi!&lt;/h1&gt;`,
+		},
+		// covering issue 20323
+		{
+			"field with predefined escaper name 2",
+			`{{.urlquery | print}}`,
+			`http://www.foo.com/index.html?title=main`,
+		},
+	} {
+		tmpl := Must(New("").Parse(test.input))
+		b := new(bytes.Buffer)
+		if err := tmpl.Execute(b, data); err != nil {
+			t.Errorf("%s: template execution failed: %s", test.desc, err)
+			continue
+		}
+		if w, g := test.output, b.String(); w != g {
+			t.Errorf("%s: escaped output: want\n\t%q\ngot\n\t%q", test.desc, w, g)
 			continue
 		}
 	}
@@ -1530,7 +1570,7 @@ func TestEscapeText(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		b, e := []byte(test.input), newEscaper(nil)
+		b, e := []byte(test.input), makeEscaper(nil)
 		c := e.escapeText(context{}, &parse.TextNode{NodeType: parse.NodeText, Text: b})
 		if !test.output.eq(c) {
 			t.Errorf("input %q: want context\n\t%v\ngot\n\t%v", test.input, test.output, c)
@@ -1595,14 +1635,14 @@ func TestEnsurePipelineContains(t *testing.T) {
 		},
 		{
 			// covering issue 10801
-			"{{.X | js.x }}",
-			".X | js.x | urlquery | html",
+			"{{.X | println.x }}",
+			".X | println.x | urlquery | html",
 			[]string{"urlquery", "html"},
 		},
 		{
 			// covering issue 10801
-			"{{.X | (print 12 | js).x }}",
-			".X | (print 12 | js).x | urlquery | html",
+			"{{.X | (print 12 | println).x }}",
+			".X | (print 12 | println).x | urlquery | html",
 			[]string{"urlquery", "html"},
 		},
 		// The following test cases ensure that the merging of internal escapers
@@ -1637,29 +1677,21 @@ func TestEnsurePipelineContains(t *testing.T) {
 			".X | html",
 			[]string{"_html_template_rcdataescaper"},
 		},
-		{
-			"{{.X | html}}",
-			".X | html | html",
-			[]string{"_html_template_htmlescaper", "_html_template_attrescaper"},
-		},
-		{
-			"{{.X | html}}",
-			".X | html | html",
-			[]string{"_html_template_rcdataescaper", "_html_template_attrescaper"},
-		},
 	}
 	for i, test := range tests {
 		tmpl := template.Must(template.New("test").Parse(test.input))
 		action, ok := (tmpl.Tree.Root.Nodes[0].(*parse.ActionNode))
 		if !ok {
-			t.Errorf("#%d: First node is not an action: %s", i, test.input)
+			t.Errorf("First node is not an action: %s", test.input)
 			continue
 		}
 		pipe := action.Pipe
+		originalIDs := make([]string, len(test.ids))
+		copy(originalIDs, test.ids)
 		ensurePipelineContains(pipe, test.ids)
 		got := pipe.String()
 		if got != test.output {
-			t.Errorf("#%d: %s, %v: want\n\t%s\ngot\n\t%s", i, test.input, test.ids, test.output, got)
+			t.Errorf("#%d: %s, %v: want\n\t%s\ngot\n\t%s", i, test.input, originalIDs, test.output, got)
 		}
 	}
 }
@@ -1814,10 +1846,57 @@ func TestErrorOnUndefined(t *testing.T) {
 
 	err := tmpl.Execute(nil, nil)
 	if err == nil {
-		t.Error("expected error")
+		t.Fatal("expected error")
 	}
 	if !strings.Contains(err.Error(), "incomplete") {
 		t.Errorf("expected error about incomplete template; got %s", err)
+	}
+}
+
+// This covers issue #20842.
+func TestIdempotentExecute(t *testing.T) {
+	tmpl := Must(New("").
+		Parse(`{{define "main"}}<body>{{template "hello"}}</body>{{end}}`))
+	Must(tmpl.
+		Parse(`{{define "hello"}}Hello, {{"Ladies & Gentlemen!"}}{{end}}`))
+	got := new(bytes.Buffer)
+	var err error
+	// Ensure that "hello" produces the same output when executed twice.
+	want := "Hello, Ladies &amp; Gentlemen!"
+	for i := 0; i < 2; i++ {
+		err = tmpl.ExecuteTemplate(got, "hello", nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if got.String() != want {
+			t.Fatalf("after executing template \"hello\", got:\n\t%q\nwant:\n\t%q\n", got.String(), want)
+		}
+		got.Reset()
+	}
+	// Ensure that the implicit re-execution of "hello" during the execution of
+	// "main" does not cause the output of "hello" to change.
+	err = tmpl.ExecuteTemplate(got, "main", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	// If the HTML escaper is added again to the action {{"Ladies & Gentlemen!"}},
+	// we would expected to see the ampersand overescaped to "&amp;amp;".
+	want = "<body>Hello, Ladies &amp; Gentlemen!</body>"
+	if got.String() != want {
+		t.Errorf("after executing template \"main\", got:\n\t%q\nwant:\n\t%q\n", got.String(), want)
+	}
+}
+
+// This covers issue #21844.
+func TestAddExistingTreeError(t *testing.T) {
+	tmpl := Must(New("foo").Parse(`<p>{{.}}</p>`))
+	tmpl, err := tmpl.AddParseTree("bar", tmpl.Tree)
+	if err == nil {
+		t.Fatalf("expected error after AddParseTree")
+	}
+	const want = `html/template: cannot add parse tree that template "foo" already references`
+	if got := err.Error(); got != want {
+		t.Errorf("got error:\n\t%q\nwant:\n\t%q\n", got, want)
 	}
 }
 
@@ -1828,5 +1907,27 @@ func BenchmarkEscapedExecute(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		tmpl.Execute(&buf, "foo & 'bar' & baz")
 		buf.Reset()
+	}
+}
+
+// Covers issue 22780.
+func TestOrphanedTemplate(t *testing.T) {
+	t1 := Must(New("foo").Parse(`<a href="{{.}}">link1</a>`))
+	t2 := Must(t1.New("foo").Parse(`bar`))
+
+	var b bytes.Buffer
+	const wantError = `template: "foo" is an incomplete or empty template`
+	if err := t1.Execute(&b, "javascript:alert(1)"); err == nil {
+		t.Fatal("expected error executing t1")
+	} else if gotError := err.Error(); gotError != wantError {
+		t.Fatalf("got t1 execution error:\n\t%s\nwant:\n\t%s", gotError, wantError)
+	}
+	b.Reset()
+	if err := t2.Execute(&b, nil); err != nil {
+		t.Fatalf("error executing t2: %s", err)
+	}
+	const want = "bar"
+	if got := b.String(); got != want {
+		t.Fatalf("t2 rendered %q, want %q", got, want)
 	}
 }

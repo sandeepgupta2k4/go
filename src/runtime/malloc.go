@@ -380,6 +380,7 @@ func mallocinit() {
 	}
 	mheap_.arena_end = p + pSize
 	mheap_.arena_used = p1
+	mheap_.arena_alloc = p1
 	mheap_.arena_reserved = reserved
 
 	if mheap_.arena_start&(_PageSize-1) != 0 {
@@ -398,7 +399,13 @@ func mallocinit() {
 // h.arena_start and h.arena_end. sysAlloc returns nil on failure.
 // There is no corresponding free function.
 func (h *mheap) sysAlloc(n uintptr) unsafe.Pointer {
-	if n > h.arena_end-h.arena_used {
+	// strandLimit is the maximum number of bytes to strand from
+	// the current arena block. If we would need to strand more
+	// than this, we fall back to sysAlloc'ing just enough for
+	// this allocation.
+	const strandLimit = 16 << 20
+
+	if n > h.arena_end-h.arena_alloc {
 		// If we haven't grown the arena to _MaxMem yet, try
 		// to reserve some more address space.
 		p_size := round(n+_PageSize, 256<<20)
@@ -409,41 +416,62 @@ func (h *mheap) sysAlloc(n uintptr) unsafe.Pointer {
 			var reserved bool
 			p := uintptr(sysReserve(unsafe.Pointer(h.arena_end), p_size, &reserved))
 			if p == 0 {
-				return nil
+				// TODO: Try smaller reservation
+				// growths in case we're in a crowded
+				// 32-bit address space.
+				goto reservationFailed
 			}
+			// p can be just about anywhere in the address
+			// space, including before arena_end.
 			if p == h.arena_end {
-				// The new reservation is contiguous
-				// with the old reservation.
+				// The new block is contiguous with
+				// the current block. Extend the
+				// current arena block.
 				h.arena_end = new_end
 				h.arena_reserved = reserved
-			} else if h.arena_start <= p && p+p_size-h.arena_start-1 <= _MaxMem {
+			} else if h.arena_start <= p && p+p_size-h.arena_start-1 <= _MaxMem && h.arena_end-h.arena_alloc < strandLimit {
 				// We were able to reserve more memory
 				// within the arena space, but it's
 				// not contiguous with our previous
-				// reservation. Skip over the unused
-				// address space.
+				// reservation. It could be before or
+				// after our current arena_used.
 				//
 				// Keep everything page-aligned.
 				// Our pages are bigger than hardware pages.
 				h.arena_end = p + p_size
-				used := p + (-p & (_PageSize - 1))
-				h.setArenaUsed(used, false)
+				p = round(p, _PageSize)
+				h.arena_alloc = p
 				h.arena_reserved = reserved
 			} else {
+				// We got a mapping, but either
+				//
+				// 1) It's not in the arena, so we
+				// can't use it. (This should never
+				// happen on 32-bit.)
+				//
+				// 2) We would need to discard too
+				// much of our current arena block to
+				// use it.
+				//
 				// We haven't added this allocation to
 				// the stats, so subtract it from a
 				// fake stat (but avoid underflow).
+				//
+				// We'll fall back to a small sysAlloc.
 				stat := uint64(p_size)
 				sysFree(unsafe.Pointer(p), p_size, &stat)
 			}
 		}
 	}
 
-	if n <= h.arena_end-h.arena_used {
+	if n <= h.arena_end-h.arena_alloc {
 		// Keep taking from our reservation.
-		p := h.arena_used
+		p := h.arena_alloc
 		sysMap(unsafe.Pointer(p), n, h.arena_reserved, &memstats.heap_sys)
-		h.setArenaUsed(p+n, true)
+		h.arena_alloc += n
+		if h.arena_alloc > h.arena_used {
+			h.setArenaUsed(h.arena_alloc, true)
+		}
 
 		if p&(_PageSize-1) != 0 {
 			throw("misrounded allocation in MHeap_SysAlloc")
@@ -451,6 +479,7 @@ func (h *mheap) sysAlloc(n uintptr) unsafe.Pointer {
 		return unsafe.Pointer(p)
 	}
 
+reservationFailed:
 	// If using 64-bit, our reservation is all we have.
 	if sys.PtrSize != 4 {
 		return nil
@@ -473,13 +502,9 @@ func (h *mheap) sysAlloc(n uintptr) unsafe.Pointer {
 		return nil
 	}
 
-	p_end := p + p_size
 	p += -p & (_PageSize - 1)
 	if p+n > h.arena_used {
 		h.setArenaUsed(p+n, true)
-		if p_end > h.arena_end {
-			h.arena_end = p_end
-		}
 	}
 
 	if p&(_PageSize-1) != 0 {
@@ -504,9 +529,8 @@ func nextFreeFast(s *mspan) gclinkptr {
 			}
 			s.allocCache >>= uint(theBit + 1)
 			s.freeindex = freeidx
-			v := gclinkptr(result*s.elemsize + s.base())
 			s.allocCount++
-			return v
+			return gclinkptr(result*s.elemsize + s.base())
 		}
 	}
 	return 0
@@ -822,6 +846,9 @@ func reflect_unsafe_New(typ *_type) unsafe.Pointer {
 
 // newarray allocates an array of n elements of type typ.
 func newarray(typ *_type, n int) unsafe.Pointer {
+	if n == 1 {
+		return mallocgc(typ.size, typ, true)
+	}
 	if n < 0 || uintptr(n) > maxSliceCap(typ.size) {
 		panic(plainError("runtime: allocation size out of range"))
 	}
@@ -838,11 +865,13 @@ func profilealloc(mp *m, x unsafe.Pointer, size uintptr) {
 	mProf_Malloc(x, size)
 }
 
-// nextSample returns the next sampling point for heap profiling.
-// It produces a random variable with a geometric distribution and
-// mean MemProfileRate. This is done by generating a uniformly
-// distributed random number and applying the cumulative distribution
-// function for an exponential.
+// nextSample returns the next sampling point for heap profiling. The goal is
+// to sample allocations on average every MemProfileRate bytes, but with a
+// completely random distribution over the allocation timeline; this
+// corresponds to a Poisson process with parameter MemProfileRate. In Poisson
+// processes, the distance between two samples follows the exponential
+// distribution (exp(MemProfileRate)), so the best return value is a random
+// number taken from an exponential distribution whose mean is MemProfileRate.
 func nextSample() int32 {
 	if GOOS == "plan9" {
 		// Plan 9 doesn't support floating point in note handler.
@@ -851,25 +880,29 @@ func nextSample() int32 {
 		}
 	}
 
-	period := MemProfileRate
+	return fastexprand(MemProfileRate)
+}
 
-	// make nextSample not overflow. Maximum possible step is
-	// -ln(1/(1<<kRandomBitCount)) * period, approximately 20 * period.
+// fastexprand returns a random number from an exponential distribution with
+// the specified mean.
+func fastexprand(mean int) int32 {
+	// Avoid overflow. Maximum possible step is
+	// -ln(1/(1<<randomBitCount)) * mean, approximately 20 * mean.
 	switch {
-	case period > 0x7000000:
-		period = 0x7000000
-	case period == 0:
+	case mean > 0x7000000:
+		mean = 0x7000000
+	case mean == 0:
 		return 0
 	}
 
-	// Let m be the sample rate,
-	// the probability distribution function is m*exp(-mx), so the CDF is
-	// p = 1 - exp(-mx), so
-	// q = 1 - p == exp(-mx)
-	// log_e(q) = -mx
-	// -log_e(q)/m = x
-	// x = -log_e(q) * period
-	// x = log_2(q) * (-log_e(2)) * period    ; Using log_2 for efficiency
+	// Take a random sample of the exponential distribution exp(-mean*x).
+	// The probability distribution function is mean*exp(-mean*x), so the CDF is
+	// p = 1 - exp(-mean*x), so
+	// q = 1 - p == exp(-mean*x)
+	// log_e(q) = -mean*x
+	// -log_e(q)/mean = x
+	// x = -log_e(q) * mean
+	// x = log_2(q) * (-log_e(2)) * mean    ; Using log_2 for efficiency
 	const randomBitCount = 26
 	q := fastrand()%(1<<randomBitCount) + 1
 	qlog := fastlog2(float64(q)) - randomBitCount
@@ -877,7 +910,7 @@ func nextSample() int32 {
 		qlog = 0
 	}
 	const minusLog2 = -0.6931471805599453 // -ln(2)
-	return int32(qlog*(minusLog2*float64(period))) + 1
+	return int32(qlog*(minusLog2*float64(mean))) + 1
 }
 
 // nextSampleNoFP is similar to nextSample, but uses older,
@@ -895,7 +928,7 @@ func nextSampleNoFP() int32 {
 }
 
 type persistentAlloc struct {
-	base unsafe.Pointer
+	base *notInHeap
 	off  uintptr
 }
 
@@ -912,17 +945,17 @@ var globalAlloc struct {
 //
 // Consider marking persistentalloc'd types go:notinheap.
 func persistentalloc(size, align uintptr, sysStat *uint64) unsafe.Pointer {
-	var p unsafe.Pointer
+	var p *notInHeap
 	systemstack(func() {
 		p = persistentalloc1(size, align, sysStat)
 	})
-	return p
+	return unsafe.Pointer(p)
 }
 
 // Must run on system stack because stack growth can (re)invoke it.
 // See issue 9174.
 //go:systemstack
-func persistentalloc1(size, align uintptr, sysStat *uint64) unsafe.Pointer {
+func persistentalloc1(size, align uintptr, sysStat *uint64) *notInHeap {
 	const (
 		chunk    = 256 << 10
 		maxBlock = 64 << 10 // VM reservation granularity is 64K on windows
@@ -943,7 +976,7 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) unsafe.Pointer {
 	}
 
 	if size >= maxBlock {
-		return sysAlloc(size, sysStat)
+		return (*notInHeap)(sysAlloc(size, sysStat))
 	}
 
 	mp := acquirem()
@@ -956,7 +989,7 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) unsafe.Pointer {
 	}
 	persistent.off = round(persistent.off, align)
 	if persistent.off+size > chunk || persistent.base == nil {
-		persistent.base = sysAlloc(chunk, &memstats.other_sys)
+		persistent.base = (*notInHeap)(sysAlloc(chunk, &memstats.other_sys))
 		if persistent.base == nil {
 			if persistent == &globalAlloc.persistentAlloc {
 				unlock(&globalAlloc.mutex)
@@ -965,7 +998,7 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) unsafe.Pointer {
 		}
 		persistent.off = 0
 	}
-	p := add(persistent.base, persistent.off)
+	p := persistent.base.add(persistent.off)
 	persistent.off += size
 	releasem(mp)
 	if persistent == &globalAlloc.persistentAlloc {
@@ -977,4 +1010,20 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) unsafe.Pointer {
 		mSysStatDec(&memstats.other_sys, size)
 	}
 	return p
+}
+
+// notInHeap is off-heap memory allocated by a lower-level allocator
+// like sysAlloc or persistentAlloc.
+//
+// In general, it's better to use real types marked as go:notinheap,
+// but this serves as a generic type for situations where that isn't
+// possible (like in the allocators).
+//
+// TODO: Use this as the return type of sysAlloc, persistentAlloc, etc?
+//
+//go:notinheap
+type notInHeap struct{}
+
+func (p *notInHeap) add(bytes uintptr) *notInHeap {
+	return (*notInHeap)(unsafe.Pointer(uintptr(unsafe.Pointer(p)) + bytes))
 }

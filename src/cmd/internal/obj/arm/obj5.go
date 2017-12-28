@@ -186,7 +186,7 @@ func (c *ctxt5) rewriteToUseGot(p *obj.Prog) {
 			p.From.Offset = 0
 		}
 	}
-	if p.From3 != nil && p.From3.Name == obj.NAME_EXTERN {
+	if p.GetFrom3() != nil && p.GetFrom3().Name == obj.NAME_EXTERN {
 		c.ctxt.Diag("don't know how to handle %v with -dynlink", p)
 	}
 	var source *obj.Addr
@@ -637,7 +637,7 @@ func (c *ctxt5) softfloat() {
 		return
 	}
 
-	symsfloat := c.ctxt.Lookup("_sfloat")
+	symsfloat := c.ctxt.Lookup("runtime._sfloat")
 
 	wasfloat := 0
 	for p := c.cursym.Func.Text; p != nil; p = p.Link {
@@ -689,7 +689,7 @@ func (c *ctxt5) softfloat() {
 			next = c.newprog()
 			*next = *p
 
-			// BL _sfloat(SB)
+			// BL runtime·_sfloat(SB)
 			*p = obj.Prog{}
 			p.Ctxt = c.ctxt
 			p.Link = next

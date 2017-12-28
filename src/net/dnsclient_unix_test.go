@@ -8,6 +8,7 @@ package net
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"internal/poll"
 	"io/ioutil"
@@ -43,11 +44,14 @@ var dnsTransportFallbackTests = []struct {
 
 func TestDNSTransportFallback(t *testing.T) {
 	fake := fakeDNSServer{
-		rh: func(n, _ string, _ *dnsMsg, _ time.Time) (*dnsMsg, error) {
+		rh: func(n, _ string, q *dnsMsg, _ time.Time) (*dnsMsg, error) {
 			r := &dnsMsg{
 				dnsMsgHdr: dnsMsgHdr{
-					rcode: dnsRcodeSuccess,
+					id:       q.id,
+					response: true,
+					rcode:    dnsRcodeSuccess,
 				},
+				question: q.question,
 			}
 			if n == "udp" {
 				r.truncated = true
@@ -98,8 +102,10 @@ func TestSpecialDomainName(t *testing.T) {
 	fake := fakeDNSServer{func(_, _ string, q *dnsMsg, _ time.Time) (*dnsMsg, error) {
 		r := &dnsMsg{
 			dnsMsgHdr: dnsMsgHdr{
-				id: q.id,
+				id:       q.id,
+				response: true,
 			},
+			question: q.question,
 		}
 
 		switch q.question[0].Name {
@@ -197,6 +203,7 @@ var fakeDNSServerSuccessful = fakeDNSServer{func(_, _ string, q *dnsMsg, _ time.
 
 // Issue 13705: don't try to resolve onion addresses, etc
 func TestLookupTorOnion(t *testing.T) {
+	defer dnsWaitGroup.Wait()
 	r := Resolver{PreferGo: true, Dial: fakeDNSServerSuccessful.DialContext}
 	addrs, err := r.LookupIPAddr(context.Background(), "foo.onion")
 	if err != nil {
@@ -294,6 +301,8 @@ var updateResolvConfTests = []struct {
 }
 
 func TestUpdateResolvConf(t *testing.T) {
+	defer dnsWaitGroup.Wait()
+
 	r := Resolver{PreferGo: true, Dial: fakeDNSServerSuccessful.DialContext}
 
 	conf, err := newResolvConfTest()
@@ -449,6 +458,8 @@ var goLookupIPWithResolverConfigTests = []struct {
 }
 
 func TestGoLookupIPWithResolverConfig(t *testing.T) {
+	defer dnsWaitGroup.Wait()
+
 	fake := fakeDNSServer{func(n, s string, q *dnsMsg, _ time.Time) (*dnsMsg, error) {
 		switch s {
 		case "[2001:4860:4860::8888]:53", "8.8.8.8:53":
@@ -541,6 +552,8 @@ func TestGoLookupIPWithResolverConfig(t *testing.T) {
 
 // Test that goLookupIPOrder falls back to the host file when no DNS servers are available.
 func TestGoLookupIPOrderFallbackToFile(t *testing.T) {
+	defer dnsWaitGroup.Wait()
+
 	fake := fakeDNSServer{func(n, s string, q *dnsMsg, tm time.Time) (*dnsMsg, error) {
 		r := &dnsMsg{
 			dnsMsgHdr: dnsMsgHdr{
@@ -597,6 +610,8 @@ func TestGoLookupIPOrderFallbackToFile(t *testing.T) {
 // querying the original name instead of an error encountered
 // querying a generated name.
 func TestErrorForOriginalNameWhenSearching(t *testing.T) {
+	defer dnsWaitGroup.Wait()
+
 	const fqdn = "doesnotexist.domain"
 
 	conf, err := newResolvConfTest()
@@ -612,8 +627,10 @@ func TestErrorForOriginalNameWhenSearching(t *testing.T) {
 	fake := fakeDNSServer{func(_, _ string, q *dnsMsg, _ time.Time) (*dnsMsg, error) {
 		r := &dnsMsg{
 			dnsMsgHdr: dnsMsgHdr{
-				id: q.id,
+				id:       q.id,
+				response: true,
 			},
+			question: q.question,
 		}
 
 		switch q.question[0].Name {
@@ -649,6 +666,8 @@ func TestErrorForOriginalNameWhenSearching(t *testing.T) {
 
 // Issue 15434. If a name server gives a lame referral, continue to the next.
 func TestIgnoreLameReferrals(t *testing.T) {
+	defer dnsWaitGroup.Wait()
+
 	conf, err := newResolvConfTest()
 	if err != nil {
 		t.Fatal(err)
@@ -751,7 +770,7 @@ type fakeDNSServer struct {
 }
 
 func (server *fakeDNSServer) DialContext(_ context.Context, n, s string) (Conn, error) {
-	return &fakeDNSConn{nil, server, n, s, time.Time{}}, nil
+	return &fakeDNSConn{nil, server, n, s, nil, time.Time{}}, nil
 }
 
 type fakeDNSConn struct {
@@ -759,6 +778,7 @@ type fakeDNSConn struct {
 	server *fakeDNSServer
 	n      string
 	s      string
+	q      *dnsMsg
 	t      time.Time
 }
 
@@ -766,13 +786,43 @@ func (f *fakeDNSConn) Close() error {
 	return nil
 }
 
+func (f *fakeDNSConn) Read(b []byte) (int, error) {
+	resp, err := f.server.rh(f.n, f.s, f.q, f.t)
+	if err != nil {
+		return 0, err
+	}
+
+	bb, ok := resp.Pack()
+	if !ok {
+		return 0, errors.New("cannot marshal DNS message")
+	}
+	if len(b) < len(bb) {
+		return 0, errors.New("read would fragment DNS message")
+	}
+
+	copy(b, bb)
+	return len(bb), nil
+}
+
+func (f *fakeDNSConn) ReadFrom(b []byte) (int, Addr, error) {
+	return 0, nil, nil
+}
+
+func (f *fakeDNSConn) Write(b []byte) (int, error) {
+	f.q = new(dnsMsg)
+	if !f.q.Unpack(b) {
+		return 0, errors.New("cannot unmarshal DNS message")
+	}
+	return len(b), nil
+}
+
+func (f *fakeDNSConn) WriteTo(b []byte, addr Addr) (int, error) {
+	return 0, nil
+}
+
 func (f *fakeDNSConn) SetDeadline(t time.Time) error {
 	f.t = t
 	return nil
-}
-
-func (f *fakeDNSConn) dnsRoundTrip(q *dnsMsg) (*dnsMsg, error) {
-	return f.server.rh(f.n, f.s, q, f.t)
 }
 
 // UDP round-tripper algorithm should ignore invalid DNS responses (issue 13281).
@@ -837,7 +887,8 @@ func TestIgnoreDNSForgeries(t *testing.T) {
 		},
 	}
 
-	resp, err := dnsRoundTripUDP(c, msg)
+	dc := &dnsPacketConn{c}
+	resp, err := dc.dnsRoundTrip(msg)
 	if err != nil {
 		t.Fatalf("dnsRoundTripUDP failed: %v", err)
 	}
@@ -849,6 +900,8 @@ func TestIgnoreDNSForgeries(t *testing.T) {
 
 // Issue 16865. If a name server times out, continue to the next.
 func TestRetryTimeout(t *testing.T) {
+	defer dnsWaitGroup.Wait()
+
 	conf, err := newResolvConfTest()
 	if err != nil {
 		t.Fatal(err)
@@ -905,6 +958,8 @@ func TestRotate(t *testing.T) {
 }
 
 func testRotate(t *testing.T, rotate bool, nameservers, wantServers []string) {
+	defer dnsWaitGroup.Wait()
+
 	conf, err := newResolvConfTest()
 	if err != nil {
 		t.Fatal(err)
@@ -968,6 +1023,8 @@ func mockTXTResponse(q *dnsMsg) *dnsMsg {
 // Issue 17448. With StrictErrors enabled, temporary errors should make
 // LookupIP fail rather than return a partial result.
 func TestStrictErrorsLookupIP(t *testing.T) {
+	defer dnsWaitGroup.Wait()
+
 	conf, err := newResolvConfTest()
 	if err != nil {
 		t.Fatal(err)
@@ -1113,7 +1170,14 @@ func TestStrictErrorsLookupIP(t *testing.T) {
 			case resolveOpError:
 				return nil, &OpError{Op: "write", Err: fmt.Errorf("socket on fire")}
 			case resolveServfail:
-				return &dnsMsg{dnsMsgHdr: dnsMsgHdr{id: q.id, rcode: dnsRcodeServerFailure}}, nil
+				return &dnsMsg{
+					dnsMsgHdr: dnsMsgHdr{
+						id:       q.id,
+						response: true,
+						rcode:    dnsRcodeServerFailure,
+					},
+					question: q.question,
+				}, nil
 			case resolveTimeout:
 				return nil, poll.ErrTimeout
 			default:
@@ -1123,7 +1187,14 @@ func TestStrictErrorsLookupIP(t *testing.T) {
 			switch q.question[0].Name {
 			case searchX, name + ".":
 				// Return NXDOMAIN to utilize the search list.
-				return &dnsMsg{dnsMsgHdr: dnsMsgHdr{id: q.id, rcode: dnsRcodeNameError}}, nil
+				return &dnsMsg{
+					dnsMsgHdr: dnsMsgHdr{
+						id:       q.id,
+						response: true,
+						rcode:    dnsRcodeNameError,
+					},
+					question: q.question,
+				}, nil
 			case searchY:
 				// Return records below.
 			default:
@@ -1202,6 +1273,8 @@ func TestStrictErrorsLookupIP(t *testing.T) {
 // Issue 17448. With StrictErrors enabled, temporary errors should make
 // LookupTXT stop walking the search list.
 func TestStrictErrorsLookupTXT(t *testing.T) {
+	defer dnsWaitGroup.Wait()
+
 	conf, err := newResolvConfTest()
 	if err != nil {
 		t.Fatal(err)
@@ -1256,5 +1329,27 @@ func TestStrictErrorsLookupTXT(t *testing.T) {
 		if len(rrs) != wantRRs {
 			t.Errorf("strict=%v: got %v; want %v", strict, len(rrs), wantRRs)
 		}
+	}
+}
+
+// Test for a race between uninstalling the test hooks and closing a
+// socket connection. This used to fail when testing with -race.
+func TestDNSGoroutineRace(t *testing.T) {
+	defer dnsWaitGroup.Wait()
+
+	fake := fakeDNSServer{func(n, s string, q *dnsMsg, t time.Time) (*dnsMsg, error) {
+		time.Sleep(10 * time.Microsecond)
+		return nil, poll.ErrTimeout
+	}}
+	r := Resolver{PreferGo: true, Dial: fake.DialContext}
+
+	// The timeout here is less than the timeout used by the server,
+	// so the goroutine started to query the (fake) server will hang
+	// around after this test is done if we don't call dnsWaitGroup.Wait.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Microsecond)
+	defer cancel()
+	_, err := r.LookupIPAddr(ctx, "where.are.they.now")
+	if err == nil {
+		t.Fatal("fake DNS lookup unexpectedly succeeded")
 	}
 }

@@ -36,14 +36,14 @@ type dnsConn interface {
 	dnsRoundTrip(query *dnsMsg) (*dnsMsg, error)
 }
 
-func (c *UDPConn) dnsRoundTrip(query *dnsMsg) (*dnsMsg, error) {
-	return dnsRoundTripUDP(c, query)
+// dnsPacketConn implements the dnsConn interface for RFC 1035's
+// "UDP usage" transport mechanism. Conn is a packet-oriented connection,
+// such as a *UDPConn.
+type dnsPacketConn struct {
+	Conn
 }
 
-// dnsRoundTripUDP implements the dnsRoundTrip interface for RFC 1035's
-// "UDP usage" transport mechanism. c should be a packet-oriented connection,
-// such as a *UDPConn.
-func dnsRoundTripUDP(c io.ReadWriter, query *dnsMsg) (*dnsMsg, error) {
+func (c *dnsPacketConn) dnsRoundTrip(query *dnsMsg) (*dnsMsg, error) {
 	b, ok := query.Pack()
 	if !ok {
 		return nil, errors.New("cannot marshal DNS message")
@@ -69,14 +69,14 @@ func dnsRoundTripUDP(c io.ReadWriter, query *dnsMsg) (*dnsMsg, error) {
 	}
 }
 
-func (c *TCPConn) dnsRoundTrip(out *dnsMsg) (*dnsMsg, error) {
-	return dnsRoundTripTCP(c, out)
+// dnsStreamConn implements the dnsConn interface for RFC 1035's
+// "TCP usage" transport mechanism. Conn is a stream-oriented connection,
+// such as a *TCPConn.
+type dnsStreamConn struct {
+	Conn
 }
 
-// dnsRoundTripTCP implements the dnsRoundTrip interface for RFC 1035's
-// "TCP usage" transport mechanism. c should be a stream-oriented connection,
-// such as a *TCPConn.
-func dnsRoundTripTCP(c io.ReadWriter, query *dnsMsg) (*dnsMsg, error) {
+func (c *dnsStreamConn) dnsRoundTrip(query *dnsMsg) (*dnsMsg, error) {
 	b, ok := query.Pack()
 	if !ok {
 		return nil, errors.New("cannot marshal DNS message")
@@ -479,7 +479,9 @@ func (r *Resolver) goLookupIPCNAMEOrder(ctx context.Context, name string, order 
 	var lastErr error
 	for _, fqdn := range conf.nameList(name) {
 		for _, qtype := range qtypes {
+			dnsWaitGroup.Add(1)
 			go func(qtype uint16) {
+				defer dnsWaitGroup.Done()
 				cname, rrs, err := r.tryOneName(ctx, conf, fqdn, qtype)
 				lane <- racer{cname, rrs, err}
 			}(qtype)

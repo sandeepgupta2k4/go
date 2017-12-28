@@ -85,11 +85,6 @@ func TestDialerDualStackFDLeak(t *testing.T) {
 		t.Skip("both IPv4 and IPv6 are required")
 	}
 
-	closedPortDelay, expectClosedPortDelay := dialClosedPort()
-	if closedPortDelay > expectClosedPortDelay {
-		t.Errorf("got %v; want <= %v", closedPortDelay, expectClosedPortDelay)
-	}
-
 	before := sw.Sockets()
 	origTestHookLookupIP := testHookLookupIP
 	defer func() { testHookLookupIP = origTestHookLookupIP }()
@@ -115,7 +110,7 @@ func TestDialerDualStackFDLeak(t *testing.T) {
 	const N = 10
 	var wg sync.WaitGroup
 	wg.Add(N)
-	d := &Dialer{DualStack: true, Timeout: 100*time.Millisecond + closedPortDelay}
+	d := &Dialer{DualStack: true, Timeout: 5 * time.Second}
 	for i := 0; i < N; i++ {
 		go func() {
 			defer wg.Done()
@@ -161,6 +156,8 @@ func dialClosedPort() (actual, expected time.Duration) {
 	// but other platforms should be instantaneous.
 	if runtime.GOOS == "windows" {
 		expected = 1500 * time.Millisecond
+	} else if runtime.GOOS == "darwin" {
+		expected = 150 * time.Millisecond
 	} else {
 		expected = 95 * time.Millisecond
 	}
@@ -886,4 +883,25 @@ func TestCancelAfterDial(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		try()
 	}
+}
+
+// Issue 18806: it should always be possible to net.Dial a
+// net.Listener().Addr().String when the listen address was ":n", even
+// if the machine has halfway configured IPv6 such that it can bind on
+// "::" not connect back to that same address.
+func TestDialListenerAddr(t *testing.T) {
+	if testenv.Builder() == "" {
+		testenv.MustHaveExternalNetwork(t)
+	}
+	ln, err := Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+	c, err := Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("for addr %q, dial error: %v", addr, err)
+	}
+	c.Close()
 }

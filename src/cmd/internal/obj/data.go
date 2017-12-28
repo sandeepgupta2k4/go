@@ -117,10 +117,9 @@ func (s *LSym) WriteInt(ctxt *Link, off int64, siz int, i int64) {
 	}
 }
 
-// WriteAddr writes an address of size siz into s at offset off.
-// rsym and roff specify the relocation for the address.
-func (s *LSym) WriteAddr(ctxt *Link, off int64, siz int, rsym *LSym, roff int64) {
-	if siz != ctxt.Arch.PtrSize {
+func (s *LSym) writeAddr(ctxt *Link, off int64, siz int, rsym *LSym, roff int64, rtype objabi.RelocType) {
+	// Allow 4-byte addresses for DWARF.
+	if siz != ctxt.Arch.PtrSize && siz != 4 {
 		ctxt.Diag("WriteAddr: bad address size %d in %s", siz, s.Name)
 	}
 	s.prepwrite(ctxt, off, siz)
@@ -131,8 +130,22 @@ func (s *LSym) WriteAddr(ctxt *Link, off int64, siz int, rsym *LSym, roff int64)
 	}
 	r.Siz = uint8(siz)
 	r.Sym = rsym
-	r.Type = objabi.R_ADDR
+	r.Type = rtype
 	r.Add = roff
+}
+
+// WriteAddr writes an address of size siz into s at offset off.
+// rsym and roff specify the relocation for the address.
+func (s *LSym) WriteAddr(ctxt *Link, off int64, siz int, rsym *LSym, roff int64) {
+	s.writeAddr(ctxt, off, siz, rsym, roff, objabi.R_ADDR)
+}
+
+// WriteCURelativeAddr writes a pointer-sized address into s at offset off.
+// rsym and roff specify the relocation for the address which will be
+// resolved by the linker to an offset from the DW_AT_low_pc attribute of
+// the DWARF Compile Unit of rsym.
+func (s *LSym) WriteCURelativeAddr(ctxt *Link, off int64, rsym *LSym, roff int64) {
+	s.writeAddr(ctxt, off, ctxt.Arch.PtrSize, rsym, roff, objabi.R_ADDRCUOFF)
 }
 
 // WriteOff writes a 4 byte offset to rsym+roff into s at offset off.
