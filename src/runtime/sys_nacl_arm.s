@@ -217,13 +217,6 @@ TEXT runtime·walltime(SB),NOSPLIT,$16
 TEXT syscall·now(SB),NOSPLIT,$0
 	B runtime·walltime(SB)
 
-TEXT runtime·nacl_clock_gettime(SB),NOSPLIT,$0
-	MOVW	arg1+0(FP), R0
-	MOVW	arg2+4(FP), R1
-	NACL_SYSCALL(SYS_clock_gettime)
-	MOVW	R0, ret+8(FP)
-	RET
-
 // int64 nanotime(void) so really
 // void nanotime(int64 *nsec)
 TEXT runtime·nanotime(SB),NOSPLIT,$16
@@ -304,9 +297,6 @@ nog:
 	MOVW	$0, R0
 	RET
 
-TEXT runtime·nacl_sysinfo(SB),NOSPLIT,$16
-	RET
-
 // func getRandomData([]byte)
 TEXT runtime·getRandomData(SB),NOSPLIT,$0-12
 	MOVW arg_base+0(FP), R0
@@ -315,8 +305,8 @@ TEXT runtime·getRandomData(SB),NOSPLIT,$0-12
 	RET
 
 // Likewise, this is only valid for ARMv7+, but that's okay.
-TEXT ·publicationBarrier(SB),NOSPLIT,$-4-0
+TEXT ·publicationBarrier(SB),NOSPLIT|NOFRAME,$0-0
 	B	runtime·armPublicationBarrier(SB)
 
-TEXT runtime·read_tls_fallback(SB),NOSPLIT,$-4
+TEXT runtime·read_tls_fallback(SB),NOSPLIT|NOFRAME,$0
 	WORD $0xe7fedef0 // NACL_INSTR_ARM_ABORT_NOW (UDF #0xEDE0)

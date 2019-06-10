@@ -30,11 +30,78 @@ func (p XPos) Before(q XPos) bool {
 	return n < m || n == m && p.lico < q.lico
 }
 
+// SameFile reports whether p and q are positions in the same file.
+func (p XPos) SameFile(q XPos) bool {
+	return p.index == q.index
+}
+
 // After reports whether the position p comes after q in the source.
 // For positions with different bases, ordering is by base index.
 func (p XPos) After(q XPos) bool {
 	n, m := p.index, q.index
 	return n > m || n == m && p.lico > q.lico
+}
+
+// WithNotStmt returns the same location to be marked with DWARF is_stmt=0
+func (p XPos) WithNotStmt() XPos {
+	p.lico = p.lico.withNotStmt()
+	return p
+}
+
+// WithDefaultStmt returns the same location with undetermined is_stmt
+func (p XPos) WithDefaultStmt() XPos {
+	p.lico = p.lico.withDefaultStmt()
+	return p
+}
+
+// WithIsStmt returns the same location to be marked with DWARF is_stmt=1
+func (p XPos) WithIsStmt() XPos {
+	p.lico = p.lico.withIsStmt()
+	return p
+}
+
+// WithBogusLine returns a bogus line that won't match any recorded for the source code.
+// Its use is to disrupt the statements within an infinite loop so that the debugger
+// will not itself loop infinitely waiting for the line number to change.
+// gdb chooses not to display the bogus line; delve shows it with a complaint, but the
+// alternative behavior is to hang.
+func (p XPos) WithBogusLine() XPos {
+	p.lico = makeBogusLico()
+	return p
+}
+
+// WithXlogue returns the same location but marked with DWARF function prologue/epilogue
+func (p XPos) WithXlogue(x PosXlogue) XPos {
+	p.lico = p.lico.withXlogue(x)
+	return p
+}
+
+// LineNumber returns a string for the line number, "?" if it is not known.
+func (p XPos) LineNumber() string {
+	if !p.IsKnown() {
+		return "?"
+	}
+	return p.lico.lineNumber()
+}
+
+// FileIndex returns a smallish non-negative integer corresponding to the
+// file for this source position.  Smallish is relative; it can be thousands
+// large, but not millions.
+func (p XPos) FileIndex() int32 {
+	return p.index
+}
+
+func (p XPos) LineNumberHTML() string {
+	if !p.IsKnown() {
+		return "?"
+	}
+	return p.lico.lineNumberHTML()
+}
+
+// AtColumn1 returns the same location but shifted to column 1.
+func (p XPos) AtColumn1() XPos {
+	p.lico = p.lico.atColumn1()
+	return p
 }
 
 // A PosTable tracks Pos -> XPos conversions and vice versa.

@@ -5,6 +5,7 @@
 package runtime
 
 import (
+	"internal/cpu"
 	"runtime/internal/sys"
 	"unsafe"
 )
@@ -223,7 +224,10 @@ func efaceeq(t *_type, x, y unsafe.Pointer) bool {
 		panic(errorString("comparing uncomparable type " + t.string()))
 	}
 	if isDirectIface(t) {
-		return eq(noescape(unsafe.Pointer(&x)), noescape(unsafe.Pointer(&y)))
+		// Direct interface types are ptr, chan, map, func, and single-element structs/arrays thereof.
+		// Maps and funcs are not comparable, so they can't reach here.
+		// Ptrs, chans, and single-element items can be compared directly using ==.
+		return x == y
 	}
 	return eq(x, y)
 }
@@ -237,7 +241,8 @@ func ifaceeq(tab *itab, x, y unsafe.Pointer) bool {
 		panic(errorString("comparing uncomparable type " + t.string()))
 	}
 	if isDirectIface(t) {
-		return eq(noescape(unsafe.Pointer(&x)), noescape(unsafe.Pointer(&y)))
+		// See comment in efaceeq.
+		return x == y
 	}
 	return eq(x, y)
 }
@@ -272,25 +277,24 @@ func ifaceHash(i interface {
 
 const hashRandomBytes = sys.PtrSize / 4 * 64
 
-// used in asm_{386,amd64}.s to seed the hash function
+// used in asm_{386,amd64,arm64}.s to seed the hash function
 var aeskeysched [hashRandomBytes]byte
 
 // used in hash{32,64}.go to seed the hash function
 var hashkey [4]uintptr
 
 func alginit() {
-	// Install aes hash algorithm if we have the instructions we need
+	// Install AES hash algorithms if the instructions needed are present.
 	if (GOARCH == "386" || GOARCH == "amd64") &&
 		GOOS != "nacl" &&
-		support_aes && // AESENC
-		support_ssse3 && // PSHUFB
-		support_sse41 { // PINSR{D,Q}
-		useAeshash = true
-		algarray[alg_MEM32].hash = aeshash32
-		algarray[alg_MEM64].hash = aeshash64
-		algarray[alg_STRING].hash = aeshashstr
-		// Initialize with random data so hash collisions will be hard to engineer.
-		getRandomData(aeskeysched[:])
+		cpu.X86.HasAES && // AESENC
+		cpu.X86.HasSSSE3 && // PSHUFB
+		cpu.X86.HasSSE41 { // PINSR{D,Q}
+		initAlgAES()
+		return
+	}
+	if GOARCH == "arm64" && cpu.ARM64.HasAES {
+		initAlgAES()
 		return
 	}
 	getRandomData((*[len(hashkey) * sys.PtrSize]byte)(unsafe.Pointer(&hashkey))[:])
@@ -298,4 +302,35 @@ func alginit() {
 	hashkey[1] |= 1
 	hashkey[2] |= 1
 	hashkey[3] |= 1
+}
+
+func initAlgAES() {
+	if GOOS == "aix" {
+		// runtime.algarray is immutable on AIX: see cmd/link/internal/ld/xcoff.go
+		return
+	}
+	useAeshash = true
+	algarray[alg_MEM32].hash = aeshash32
+	algarray[alg_MEM64].hash = aeshash64
+	algarray[alg_STRING].hash = aeshashstr
+	// Initialize with random data so hash collisions will be hard to engineer.
+	getRandomData(aeskeysched[:])
+}
+
+// Note: These routines perform the read with an native endianness.
+func readUnaligned32(p unsafe.Pointer) uint32 {
+	q := (*[4]byte)(p)
+	if sys.BigEndian {
+		return uint32(q[3]) | uint32(q[2])<<8 | uint32(q[1])<<16 | uint32(q[0])<<24
+	}
+	return uint32(q[0]) | uint32(q[1])<<8 | uint32(q[2])<<16 | uint32(q[3])<<24
+}
+
+func readUnaligned64(p unsafe.Pointer) uint64 {
+	q := (*[8]byte)(p)
+	if sys.BigEndian {
+		return uint64(q[7]) | uint64(q[6])<<8 | uint64(q[5])<<16 | uint64(q[4])<<24 |
+			uint64(q[3])<<32 | uint64(q[2])<<40 | uint64(q[1])<<48 | uint64(q[0])<<56
+	}
+	return uint64(q[0]) | uint64(q[1])<<8 | uint64(q[2])<<16 | uint64(q[3])<<24 | uint64(q[4])<<32 | uint64(q[5])<<40 | uint64(q[6])<<48 | uint64(q[7])<<56
 }

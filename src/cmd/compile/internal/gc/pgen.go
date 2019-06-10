@@ -13,10 +13,9 @@ import (
 	"cmd/internal/src"
 	"cmd/internal/sys"
 	"fmt"
-	"math"
+	"internal/race"
 	"math/rand"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -28,32 +27,32 @@ var (
 	compilequeue    []*Node // functions waiting to be compiled
 )
 
-func emitptrargsmap() {
-	if Curfn.funcname() == "_" {
+func emitptrargsmap(fn *Node) {
+	if fn.funcname() == "_" {
 		return
 	}
-	sym := lookup(fmt.Sprintf("%s.args_stackmap", Curfn.funcname()))
+	sym := lookup(fmt.Sprintf("%s.args_stackmap", fn.funcname()))
 	lsym := sym.Linksym()
 
-	nptr := int(Curfn.Type.ArgWidth() / int64(Widthptr))
+	nptr := int(fn.Type.ArgWidth() / int64(Widthptr))
 	bv := bvalloc(int32(nptr) * 2)
 	nbitmap := 1
-	if Curfn.Type.NumResults() > 0 {
+	if fn.Type.NumResults() > 0 {
 		nbitmap = 2
 	}
 	off := duint32(lsym, 0, uint32(nbitmap))
 	off = duint32(lsym, off, uint32(bv.n))
 
-	if Curfn.IsMethod() {
-		onebitwalktype1(Curfn.Type.Recvs(), 0, bv)
+	if fn.IsMethod() {
+		onebitwalktype1(fn.Type.Recvs(), 0, bv)
 	}
-	if Curfn.Type.NumParams() > 0 {
-		onebitwalktype1(Curfn.Type.Params(), 0, bv)
+	if fn.Type.NumParams() > 0 {
+		onebitwalktype1(fn.Type.Params(), 0, bv)
 	}
 	off = dbvec(lsym, off, bv)
 
-	if Curfn.Type.NumResults() > 0 {
-		onebitwalktype1(Curfn.Type.Results(), 0, bv)
+	if fn.Type.NumResults() > 0 {
+		onebitwalktype1(fn.Type.Results(), 0, bv)
 		off = dbvec(lsym, off, bv)
 	}
 
@@ -155,6 +154,7 @@ func (s *ssafn) AllocFrame(f *ssa.Func) {
 	sort.Sort(byStackVar(fn.Dcl))
 
 	// Reassign stack offsets of the locals that are used.
+	lastHasPtr := false
 	for i, n := range fn.Dcl {
 		if n.Op != ONAME || n.Class() != PAUTO {
 			continue
@@ -169,10 +169,20 @@ func (s *ssafn) AllocFrame(f *ssa.Func) {
 		if w >= thearch.MAXWIDTH || w < 0 {
 			Fatalf("bad width")
 		}
+		if w == 0 && lastHasPtr {
+			// Pad between a pointer-containing object and a zero-sized object.
+			// This prevents a pointer to the zero-sized object from being interpreted
+			// as a pointer to the pointer-containing object (and causing it
+			// to be scanned when it shouldn't be). See issue 24993.
+			w = 1
+		}
 		s.stksize += w
 		s.stksize = Rnd(s.stksize, int64(n.Type.Align))
 		if types.Haspointers(n.Type) {
 			s.stkptrsize = s.stksize
+			lastHasPtr = true
+		} else {
+			lastHasPtr = false
 		}
 		if thearch.LinkArch.InFamily(sys.MIPS, sys.MIPS64, sys.ARM, sys.ARM64, sys.PPC64, sys.S390X) {
 			s.stksize = Rnd(s.stksize, int64(Widthptr))
@@ -184,15 +194,38 @@ func (s *ssafn) AllocFrame(f *ssa.Func) {
 	s.stkptrsize = Rnd(s.stkptrsize, int64(Widthreg))
 }
 
-func compile(fn *Node) {
-	Curfn = fn
-	dowidth(fn.Type)
+func funccompile(fn *Node) {
+	if Curfn != nil {
+		Fatalf("funccompile %v inside %v", fn.Func.Nname.Sym, Curfn.Func.Nname.Sym)
+	}
 
-	if fn.Nbody.Len() == 0 {
-		emitptrargsmap()
+	if fn.Type == nil {
+		if nerrors == 0 {
+			Fatalf("funccompile missing type")
+		}
 		return
 	}
 
+	// assign parameter offsets
+	dowidth(fn.Type)
+
+	if fn.Nbody.Len() == 0 {
+		// Initialize ABI wrappers if necessary.
+		fn.Func.initLSym(false)
+		emitptrargsmap(fn)
+		return
+	}
+
+	dclcontext = PAUTO
+	Curfn = fn
+
+	compile(fn)
+
+	Curfn = nil
+	dclcontext = PEXTERN
+}
+
+func compile(fn *Node) {
 	saveerrors()
 
 	order(fn)
@@ -211,8 +244,34 @@ func compile(fn *Node) {
 	// From this point, there should be no uses of Curfn. Enforce that.
 	Curfn = nil
 
+	if fn.funcname() == "_" {
+		// We don't need to generate code for this function, just report errors in its body.
+		// At this point we've generated any errors needed.
+		// (Beyond here we generate only non-spec errors, like "stack frame too large".)
+		// See issue 29870.
+		return
+	}
+
 	// Set up the function's LSym early to avoid data races with the assemblers.
-	fn.Func.initLSym()
+	fn.Func.initLSym(true)
+
+	// Make sure type syms are declared for all types that might
+	// be types of stack objects. We need to do this here
+	// because symbols must be allocated before the parallel
+	// phase of the compiler.
+	for _, n := range fn.Func.Dcl {
+		switch n.Class() {
+		case PPARAM, PPARAMOUT, PAUTO:
+			if livenessShouldTrack(n) && n.Addrtaken() {
+				dtypesym(n.Type)
+				// Also make sure we allocate a linker symbol
+				// for the stack object data, for the same reason.
+				if fn.Func.lsym.Func.StackObjects == nil {
+					fn.Func.lsym.Func.StackObjects = Ctxt.Lookup(fn.Func.lsym.Name + ".stkobj")
+				}
+			}
+		}
+	}
 
 	if compilenow() {
 		compileSSA(fn, 0)
@@ -237,22 +296,37 @@ const maxStackSize = 1 << 30
 // worker indicates which of the backend workers is doing the processing.
 func compileSSA(fn *Node, worker int) {
 	f := buildssa(fn, worker)
-	if f.Frontend().(*ssafn).stksize >= maxStackSize {
+	// Note: check arg size to fix issue 25507.
+	if f.Frontend().(*ssafn).stksize >= maxStackSize || fn.Type.ArgWidth() >= maxStackSize {
 		largeStackFramesMu.Lock()
-		largeStackFrames = append(largeStackFrames, fn.Pos)
+		largeStackFrames = append(largeStackFrames, largeStack{locals: f.Frontend().(*ssafn).stksize, args: fn.Type.ArgWidth(), pos: fn.Pos})
 		largeStackFramesMu.Unlock()
 		return
 	}
 	pp := newProgs(fn, worker)
+	defer pp.Free()
 	genssa(f, pp)
-	pp.Flush()
+	// Check frame size again.
+	// The check above included only the space needed for local variables.
+	// After genssa, the space needed includes local variables and the callee arg region.
+	// We must do this check prior to calling pp.Flush.
+	// If there are any oversized stack frames,
+	// the assembler may emit inscrutable complaints about invalid instructions.
+	if pp.Text.To.Offset >= maxStackSize {
+		largeStackFramesMu.Lock()
+		locals := f.Frontend().(*ssafn).stksize
+		largeStackFrames = append(largeStackFrames, largeStack{locals: locals, args: fn.Type.ArgWidth(), callee: pp.Text.To.Offset - locals, pos: fn.Pos})
+		largeStackFramesMu.Unlock()
+		return
+	}
+
+	pp.Flush() // assemble, fill in boilerplate, etc.
 	// fieldtrack must be called after pp.Flush. See issue 20014.
 	fieldtrack(pp.Text.From.Sym, fn.Func.FieldTrack)
-	pp.Free()
 }
 
 func init() {
-	if raceEnabled {
+	if race.Enabled {
 		rand.Seed(time.Now().UnixNano())
 	}
 }
@@ -263,7 +337,7 @@ func init() {
 func compileFunctions() {
 	if len(compilequeue) != 0 {
 		sizeCalculationDisabled = true // not safe to calculate sizes concurrently
-		if raceEnabled {
+		if race.Enabled {
 			// Randomize compilation order to try to shake out races.
 			tmp := make([]*Node, len(compilequeue))
 			perm := rand.Perm(len(compilequeue))
@@ -275,7 +349,7 @@ func compileFunctions() {
 			// Compile the longest functions first,
 			// since they're most likely to be the slowest.
 			// This helps avoid stragglers.
-			obj.SortSlice(compilequeue, func(i, j int) bool {
+			sort.Slice(compilequeue, func(i, j int) bool {
 				return compilequeue[i].Nbody.Len() > compilequeue[j].Nbody.Len()
 			})
 		}
@@ -304,8 +378,6 @@ func compileFunctions() {
 
 func debuginfo(fnsym *obj.LSym, curfn interface{}) ([]dwarf.Scope, dwarf.InlCalls) {
 	fn := curfn.(*Node)
-	debugInfo := fn.Func.DebugInfo
-	fn.Func.DebugInfo = nil
 	if fn.Func.Nname != nil {
 		if expect := fn.Func.Nname.Sym.Linksym(); fnsym != expect {
 			Fatalf("unexpected fnsym: %v != %v", fnsym, expect)
@@ -344,7 +416,7 @@ func debuginfo(fnsym *obj.LSym, curfn interface{}) ([]dwarf.Scope, dwarf.InlCall
 		})
 	}
 
-	decls, dwarfVars := createDwarfVars(fnsym, debugInfo, automDecls)
+	decls, dwarfVars := createDwarfVars(fnsym, fn.Func, automDecls)
 
 	var varScopes []ScopeID
 	for _, decl := range decls {
@@ -372,7 +444,7 @@ func debuginfo(fnsym *obj.LSym, curfn interface{}) ([]dwarf.Scope, dwarf.InlCall
 	scopes := assembleScopes(fnsym, fn, dwarfVars, varScopes)
 	var inlcalls dwarf.InlCalls
 	if genDwarfInline > 0 {
-		inlcalls = assembleInlines(fnsym, fn, dwarfVars)
+		inlcalls = assembleInlines(fnsym, dwarfVars)
 	}
 	return scopes, inlcalls
 }
@@ -387,115 +459,80 @@ func createSimpleVars(automDecls []*Node) ([]*Node, []*dwarf.Var, map[*Node]bool
 		if n.IsAutoTmp() {
 			continue
 		}
-		var abbrev int
-		offs := n.Xoffset
 
-		switch n.Class() {
-		case PAUTO:
-			abbrev = dwarf.DW_ABRV_AUTO
-			if Ctxt.FixedFrameSize() == 0 {
-				offs -= int64(Widthptr)
-			}
-			if objabi.Framepointer_enabled(objabi.GOOS, objabi.GOARCH) {
-				offs -= int64(Widthptr)
-			}
-
-		case PPARAM, PPARAMOUT:
-			abbrev = dwarf.DW_ABRV_PARAM
-			offs += Ctxt.FixedFrameSize()
-		default:
-			Fatalf("createSimpleVars unexpected type %v for node %v", n.Class(), n)
-		}
-
-		selected[n] = true
-		typename := dwarf.InfoPrefix + typesymname(n.Type)
 		decls = append(decls, n)
-		inlIndex := 0
-		if genDwarfInline > 1 {
-			if n.InlFormal() || n.InlLocal() {
-				inlIndex = posInlIndex(n.Pos) + 1
-				if n.InlFormal() {
-					abbrev = dwarf.DW_ABRV_PARAM
-				}
-			}
-		}
-		declpos := Ctxt.InnermostPos(n.Pos)
-		vars = append(vars, &dwarf.Var{
-			Name:          n.Sym.Name,
-			IsReturnValue: n.Class() == PPARAMOUT,
-			IsInlFormal:   n.InlFormal(),
-			Abbrev:        abbrev,
-			StackOffset:   int32(offs),
-			Type:          Ctxt.Lookup(typename),
-			DeclFile:      declpos.Base().SymFilename(),
-			DeclLine:      declpos.Line(),
-			DeclCol:       declpos.Col(),
-			InlIndex:      int32(inlIndex),
-			ChildIndex:    -1,
-		})
+		vars = append(vars, createSimpleVar(n))
+		selected[n] = true
 	}
 	return decls, vars, selected
 }
 
-type varPart struct {
-	varOffset int64
-	slot      ssa.SlotID
-}
+func createSimpleVar(n *Node) *dwarf.Var {
+	var abbrev int
+	offs := n.Xoffset
 
-func createComplexVars(fnsym *obj.LSym, debugInfo *ssa.FuncDebug, automDecls []*Node) ([]*Node, []*dwarf.Var, map[*Node]bool) {
-	for _, blockDebug := range debugInfo.Blocks {
-		for _, locList := range blockDebug.Variables {
-			for _, loc := range locList.Locations {
-				if loc.StartProg != nil {
-					loc.StartPC = loc.StartProg.Pc
-				}
-				if loc.EndProg != nil {
-					loc.EndPC = loc.EndProg.Pc
-				} else {
-					loc.EndPC = fnsym.Size
-				}
-				if Debug_locationlist == 0 {
-					loc.EndProg = nil
-					loc.StartProg = nil
-				}
+	switch n.Class() {
+	case PAUTO:
+		abbrev = dwarf.DW_ABRV_AUTO
+		if Ctxt.FixedFrameSize() == 0 {
+			offs -= int64(Widthptr)
+		}
+		if objabi.Framepointer_enabled(objabi.GOOS, objabi.GOARCH) || objabi.GOARCH == "arm64" {
+			// There is a word space for FP on ARM64 even if the frame pointer is disabled
+			offs -= int64(Widthptr)
+		}
+
+	case PPARAM, PPARAMOUT:
+		abbrev = dwarf.DW_ABRV_PARAM
+		offs += Ctxt.FixedFrameSize()
+	default:
+		Fatalf("createSimpleVar unexpected class %v for node %v", n.Class(), n)
+	}
+
+	typename := dwarf.InfoPrefix + typesymname(n.Type)
+	inlIndex := 0
+	if genDwarfInline > 1 {
+		if n.InlFormal() || n.InlLocal() {
+			inlIndex = posInlIndex(n.Pos) + 1
+			if n.InlFormal() {
+				abbrev = dwarf.DW_ABRV_PARAM
 			}
 		}
 	}
-
-	// Group SSA variables by the user variable they were decomposed from.
-	varParts := map[*Node][]varPart{}
-	ssaVars := make(map[*Node]bool)
-	for slotID, slot := range debugInfo.VarSlots {
-		for slot.SplitOf != nil {
-			slot = slot.SplitOf
-		}
-		n := slot.N.(*Node)
-		ssaVars[n] = true
-		varParts[n] = append(varParts[n], varPart{varOffset(slot), ssa.SlotID(slotID)})
+	declpos := Ctxt.InnermostPos(n.Pos)
+	return &dwarf.Var{
+		Name:          n.Sym.Name,
+		IsReturnValue: n.Class() == PPARAMOUT,
+		IsInlFormal:   n.InlFormal(),
+		Abbrev:        abbrev,
+		StackOffset:   int32(offs),
+		Type:          Ctxt.Lookup(typename),
+		DeclFile:      declpos.RelFilename(),
+		DeclLine:      declpos.RelLine(),
+		DeclCol:       declpos.Col(),
+		InlIndex:      int32(inlIndex),
+		ChildIndex:    -1,
 	}
+}
+
+// createComplexVars creates recomposed DWARF vars with location lists,
+// suitable for describing optimized code.
+func createComplexVars(fn *Func) ([]*Node, []*dwarf.Var, map[*Node]bool) {
+	debugInfo := fn.DebugInfo
 
 	// Produce a DWARF variable entry for each user variable.
-	// Don't iterate over the map -- that's nondeterministic, and
-	// createComplexVar has side effects. Instead, go by slot.
 	var decls []*Node
 	var vars []*dwarf.Var
-	for _, slot := range debugInfo.VarSlots {
-		for slot.SplitOf != nil {
-			slot = slot.SplitOf
-		}
-		n := slot.N.(*Node)
-		parts := varParts[n]
-		if parts == nil {
-			continue
-		}
-		// Don't work on this variable again, no matter how many slots it has.
-		delete(varParts, n)
+	ssaVars := make(map[*Node]bool)
 
-		// Get the order the parts need to be in to represent the memory
-		// of the decomposed user variable.
-		sort.Sort(partsByVarOffset(parts))
+	for varID, dvar := range debugInfo.Vars {
+		n := dvar.(*Node)
+		ssaVars[n] = true
+		for _, slot := range debugInfo.VarSlots[varID] {
+			ssaVars[debugInfo.Slots[slot].N.(*Node)] = true
+		}
 
-		if dvar := createComplexVar(debugInfo, n, parts); dvar != nil {
+		if dvar := createComplexVar(fn, ssa.VarID(varID)); dvar != nil {
 			decls = append(decls, n)
 			vars = append(vars, dvar)
 		}
@@ -504,33 +541,36 @@ func createComplexVars(fnsym *obj.LSym, debugInfo *ssa.FuncDebug, automDecls []*
 	return decls, vars, ssaVars
 }
 
-func createDwarfVars(fnsym *obj.LSym, debugInfo *ssa.FuncDebug, automDecls []*Node) ([]*Node, []*dwarf.Var) {
+// createDwarfVars process fn, returning a list of DWARF variables and the
+// Nodes they represent.
+func createDwarfVars(fnsym *obj.LSym, fn *Func, automDecls []*Node) ([]*Node, []*dwarf.Var) {
 	// Collect a raw list of DWARF vars.
 	var vars []*dwarf.Var
 	var decls []*Node
 	var selected map[*Node]bool
-	if Ctxt.Flag_locationlists && Ctxt.Flag_optimize && debugInfo != nil {
-		decls, vars, selected = createComplexVars(fnsym, debugInfo, automDecls)
+	if Ctxt.Flag_locationlists && Ctxt.Flag_optimize && fn.DebugInfo != nil {
+		decls, vars, selected = createComplexVars(fn)
 	} else {
 		decls, vars, selected = createSimpleVars(automDecls)
 	}
 
-	var dcl []*Node
+	dcl := automDecls
 	if fnsym.WasInlined() {
 		dcl = preInliningDcls(fnsym)
-	} else {
-		dcl = automDecls
 	}
 
 	// If optimization is enabled, the list above will typically be
 	// missing some of the original pre-optimization variables in the
 	// function (they may have been promoted to registers, folded into
-	// constants, dead-coded away, etc). Here we add back in entries
+	// constants, dead-coded away, etc).  Input arguments not eligible
+	// for SSA optimization are also missing.  Here we add back in entries
 	// for selected missing vars. Note that the recipe below creates a
 	// conservative location. The idea here is that we want to
 	// communicate to the user that "yes, there is a variable named X
 	// in this function, but no, I don't have enough information to
 	// reliably report its contents."
+	// For non-SSA-able arguments, however, the correct information
+	// is known -- they have a single home on the stack.
 	for _, n := range dcl {
 		if _, found := selected[n]; found {
 			continue
@@ -539,11 +579,37 @@ func createDwarfVars(fnsym *obj.LSym, debugInfo *ssa.FuncDebug, automDecls []*No
 		if c == '.' || n.Type.IsUntyped() {
 			continue
 		}
+		if n.Class() == PPARAM && !canSSAType(n.Type) {
+			// SSA-able args get location lists, and may move in and
+			// out of registers, so those are handled elsewhere.
+			// Autos and named output params seem to get handled
+			// with VARDEF, which creates location lists.
+			// Args not of SSA-able type are treated here; they
+			// are homed on the stack in a single place for the
+			// entire call.
+			vars = append(vars, createSimpleVar(n))
+			decls = append(decls, n)
+			continue
+		}
 		typename := dwarf.InfoPrefix + typesymname(n.Type)
 		decls = append(decls, n)
 		abbrev := dwarf.DW_ABRV_AUTO_LOCLIST
+		isReturnValue := (n.Class() == PPARAMOUT)
 		if n.Class() == PPARAM || n.Class() == PPARAMOUT {
 			abbrev = dwarf.DW_ABRV_PARAM_LOCLIST
+		} else if n.Class() == PAUTOHEAP {
+			// If dcl in question has been promoted to heap, do a bit
+			// of extra work to recover original class (auto or param);
+			// see issue 30908. This insures that we get the proper
+			// signature in the abstract function DIE, but leaves a
+			// misleading location for the param (we want pointer-to-heap
+			// and not stack).
+			// TODO(thanm): generate a better location expression
+			stackcopy := n.Name.Param.Stackcopy
+			if stackcopy != nil && (stackcopy.Class() == PPARAM || stackcopy.Class() == PPARAMOUT) {
+				abbrev = dwarf.DW_ABRV_PARAM_LOCLIST
+				isReturnValue = (stackcopy.Class() == PPARAMOUT)
+			}
 		}
 		inlIndex := 0
 		if genDwarfInline > 1 {
@@ -557,12 +623,12 @@ func createDwarfVars(fnsym *obj.LSym, debugInfo *ssa.FuncDebug, automDecls []*No
 		declpos := Ctxt.InnermostPos(n.Pos)
 		vars = append(vars, &dwarf.Var{
 			Name:          n.Sym.Name,
-			IsReturnValue: n.Class() == PPARAMOUT,
+			IsReturnValue: isReturnValue,
 			Abbrev:        abbrev,
 			StackOffset:   int32(n.Xoffset),
 			Type:          Ctxt.Lookup(typename),
-			DeclFile:      declpos.Base().SymFilename(),
-			DeclLine:      declpos.Line(),
+			DeclFile:      declpos.RelFilename(),
+			DeclLine:      declpos.RelLine(),
 			DeclCol:       declpos.Col(),
 			InlIndex:      int32(inlIndex),
 			ChildIndex:    -1,
@@ -591,13 +657,8 @@ func createDwarfVars(fnsym *obj.LSym, debugInfo *ssa.FuncDebug, automDecls []*No
 // with local vars; disregard this versioning when sorting.
 func preInliningDcls(fnsym *obj.LSym) []*Node {
 	fn := Ctxt.DwFixups.GetPrecursorFunc(fnsym).(*Node)
-	var dcl, rdcl []*Node
-	if fn.Name.Defn != nil {
-		dcl = fn.Func.Inldcl.Slice() // local function
-	} else {
-		dcl = fn.Func.Dcl // imported function
-	}
-	for _, n := range dcl {
+	var rdcl []*Node
+	for _, n := range fn.Func.Inl.Dcl {
 		c := n.Sym.Name[0]
 		// Avoid reporting "_" parameters, since if there are more than
 		// one, it can result in a collision later on, as in #23179.
@@ -606,55 +667,13 @@ func preInliningDcls(fnsym *obj.LSym) []*Node {
 		}
 		rdcl = append(rdcl, n)
 	}
-	sort.Sort(byNodeName(rdcl))
 	return rdcl
 }
-
-func cmpNodeName(a, b *Node) bool {
-	aart := 0
-	if strings.HasPrefix(a.Sym.Name, "~") {
-		aart = 1
-	}
-	bart := 0
-	if strings.HasPrefix(b.Sym.Name, "~") {
-		bart = 1
-	}
-	if aart != bart {
-		return aart < bart
-	}
-
-	aname := unversion(a.Sym.Name)
-	bname := unversion(b.Sym.Name)
-	return aname < bname
-}
-
-// byNodeName implements sort.Interface for []*Node using cmpNodeName.
-type byNodeName []*Node
-
-func (s byNodeName) Len() int           { return len(s) }
-func (s byNodeName) Less(i, j int) bool { return cmpNodeName(s[i], s[j]) }
-func (s byNodeName) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
-
-// varOffset returns the offset of slot within the user variable it was
-// decomposed from. This has nothing to do with its stack offset.
-func varOffset(slot *ssa.LocalSlot) int64 {
-	offset := slot.Off
-	for ; slot.SplitOf != nil; slot = slot.SplitOf {
-		offset += slot.SplitOffset
-	}
-	return offset
-}
-
-type partsByVarOffset []varPart
-
-func (a partsByVarOffset) Len() int           { return len(a) }
-func (a partsByVarOffset) Less(i, j int) bool { return a[i].varOffset < a[j].varOffset }
-func (a partsByVarOffset) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 
 // stackOffset returns the stack location of a LocalSlot relative to the
 // stack pointer, suitable for use in a DWARF location entry. This has nothing
 // to do with its offset in the user variable.
-func stackOffset(slot *ssa.LocalSlot) int32 {
+func stackOffset(slot ssa.LocalSlot) int32 {
 	n := slot.N.(*Node)
 	var base int64
 	switch n.Class() {
@@ -662,7 +681,8 @@ func stackOffset(slot *ssa.LocalSlot) int32 {
 		if Ctxt.FixedFrameSize() == 0 {
 			base -= int64(Widthptr)
 		}
-		if objabi.Framepointer_enabled(objabi.GOOS, objabi.GOARCH) {
+		if objabi.Framepointer_enabled(objabi.GOOS, objabi.GOARCH) || objabi.GOARCH == "arm64" {
+			// There is a word space for FP on ARM64 even if the frame pointer is disabled
 			base -= int64(Widthptr)
 		}
 	case PPARAM, PPARAMOUT:
@@ -671,24 +691,17 @@ func stackOffset(slot *ssa.LocalSlot) int32 {
 	return int32(base + n.Xoffset + slot.Off)
 }
 
-// createComplexVar builds a DWARF variable entry and location list representing n.
-func createComplexVar(debugInfo *ssa.FuncDebug, n *Node, parts []varPart) *dwarf.Var {
-	slots := debugInfo.Slots
-	var offs int64 // base stack offset for this kind of variable
+// createComplexVar builds a single DWARF variable entry and location list.
+func createComplexVar(fn *Func, varID ssa.VarID) *dwarf.Var {
+	debug := fn.DebugInfo
+	n := debug.Vars[varID].(*Node)
+
 	var abbrev int
 	switch n.Class() {
 	case PAUTO:
 		abbrev = dwarf.DW_ABRV_AUTO_LOCLIST
-		if Ctxt.FixedFrameSize() == 0 {
-			offs -= int64(Widthptr)
-		}
-		if objabi.Framepointer_enabled(objabi.GOOS, objabi.GOARCH) {
-			offs -= int64(Widthptr)
-		}
-
 	case PPARAM, PPARAMOUT:
 		abbrev = dwarf.DW_ABRV_PARAM_LOCLIST
-		offs += Ctxt.FixedFrameSize()
 	default:
 		return nil
 	}
@@ -712,196 +725,20 @@ func createComplexVar(debugInfo *ssa.FuncDebug, n *Node, parts []varPart) *dwarf
 		Abbrev:        abbrev,
 		Type:          Ctxt.Lookup(typename),
 		// The stack offset is used as a sorting key, so for decomposed
-		// variables just give it the lowest one. It's not used otherwise.
+		// variables just give it the first one. It's not used otherwise.
 		// This won't work well if the first slot hasn't been assigned a stack
 		// location, but it's not obvious how to do better.
-		StackOffset: int32(stackOffset(slots[parts[0].slot])),
-		DeclFile:    declpos.Base().SymFilename(),
-		DeclLine:    declpos.Line(),
+		StackOffset: stackOffset(debug.Slots[debug.VarSlots[varID][0]]),
+		DeclFile:    declpos.RelFilename(),
+		DeclLine:    declpos.RelLine(),
 		DeclCol:     declpos.Col(),
 		InlIndex:    int32(inlIndex),
 		ChildIndex:  -1,
 	}
-
-	if Debug_locationlist != 0 {
-		Ctxt.Logf("Building location list for %+v. Parts:\n", n)
-		for _, part := range parts {
-			Ctxt.Logf("\t%v => %v\n", debugInfo.Slots[part.slot], debugInfo.SlotLocsString(part.slot))
-		}
-	}
-
-	// Given a variable that's been decomposed into multiple parts,
-	// its location list may need a new entry after the beginning or
-	// end of every location entry for each of its parts. For example:
-	//
-	// [variable]    [pc range]
-	// string.ptr    |----|-----|    |----|
-	// string.len    |------------|  |--|
-	// ... needs a location list like:
-	// string        |----|-----|-|  |--|-|
-	//
-	// Note that location entries may or may not line up with each other,
-	// and some of the result will only have one or the other part.
-	//
-	// To build the resulting list:
-	// - keep a "current" pointer for each part
-	// - find the next transition point
-	// - advance the current pointer for each part up to that transition point
-	// - build the piece for the range between that transition point and the next
-	// - repeat
-
-	type locID struct {
-		block int
-		loc   int
-	}
-	findLoc := func(part varPart, id locID) *ssa.VarLoc {
-		if id.block >= len(debugInfo.Blocks) {
-			return nil
-		}
-		return debugInfo.Blocks[id.block].Variables[part.slot].Locations[id.loc]
-	}
-	nextLoc := func(part varPart, id locID) (locID, *ssa.VarLoc) {
-		// Check if there's another loc in this block
-		id.loc++
-		if b := debugInfo.Blocks[id.block]; b != nil && id.loc < len(b.Variables[part.slot].Locations) {
-			return id, findLoc(part, id)
-		}
-		// Find the next block that has a loc for this part.
-		id.loc = 0
-		id.block++
-		for ; id.block < len(debugInfo.Blocks); id.block++ {
-			if b := debugInfo.Blocks[id.block]; b != nil && len(b.Variables[part.slot].Locations) != 0 {
-				return id, findLoc(part, id)
-			}
-		}
-		return id, nil
-	}
-	curLoc := make([]locID, len(slots))
-	// Position each pointer at the first entry for its slot.
-	for _, part := range parts {
-		if b := debugInfo.Blocks[0]; b != nil && len(b.Variables[part.slot].Locations) != 0 {
-			// Block 0 has an entry; no need to advance.
-			continue
-		}
-		curLoc[part.slot], _ = nextLoc(part, curLoc[part.slot])
-	}
-
-	// findBoundaryAfter finds the next beginning or end of a piece after currentPC.
-	findBoundaryAfter := func(currentPC int64) int64 {
-		min := int64(math.MaxInt64)
-		for _, part := range parts {
-			// For each part, find the first PC greater than current. Doesn't
-			// matter if it's a start or an end, since we're looking for any boundary.
-			// If it's the new winner, save it.
-		onePart:
-			for i, loc := curLoc[part.slot], findLoc(part, curLoc[part.slot]); loc != nil; i, loc = nextLoc(part, i) {
-				for _, pc := range [2]int64{loc.StartPC, loc.EndPC} {
-					if pc > currentPC {
-						if pc < min {
-							min = pc
-						}
-						break onePart
-					}
-				}
-			}
-		}
-		return min
-	}
-	var start int64
-	end := findBoundaryAfter(0)
-	for {
-		// Advance to the next chunk.
-		start = end
-		end = findBoundaryAfter(start)
-		if end == math.MaxInt64 {
-			break
-		}
-
-		dloc := dwarf.Location{StartPC: start, EndPC: end}
-		if Debug_locationlist != 0 {
-			Ctxt.Logf("Processing range %x -> %x\n", start, end)
-		}
-
-		// Advance curLoc to the last location that starts before/at start.
-		// After this loop, if there's a location that covers [start, end), it will be current.
-		// Otherwise the current piece will be too early.
-		for _, part := range parts {
-			choice := locID{-1, -1}
-			for i, loc := curLoc[part.slot], findLoc(part, curLoc[part.slot]); loc != nil; i, loc = nextLoc(part, i) {
-				if loc.StartPC > start {
-					break //overshot
-				}
-				choice = i // best yet
-			}
-			if choice.block != -1 {
-				curLoc[part.slot] = choice
-			}
-			if Debug_locationlist != 0 {
-				Ctxt.Logf("\t %v => %v", slots[part.slot], curLoc[part.slot])
-			}
-		}
-		if Debug_locationlist != 0 {
-			Ctxt.Logf("\n")
-		}
-		// Assemble the location list entry for this chunk.
-		present := 0
-		for _, part := range parts {
-			dpiece := dwarf.Piece{
-				Length: slots[part.slot].Type.Size(),
-			}
-			loc := findLoc(part, curLoc[part.slot])
-			if loc == nil || start >= loc.EndPC || end <= loc.StartPC {
-				if Debug_locationlist != 0 {
-					Ctxt.Logf("\t%v: missing", slots[part.slot])
-				}
-				dpiece.Missing = true
-				dloc.Pieces = append(dloc.Pieces, dpiece)
-				continue
-			}
-			present++
-			if Debug_locationlist != 0 {
-				Ctxt.Logf("\t%v: %v", slots[part.slot], debugInfo.Blocks[curLoc[part.slot].block].LocString(loc))
-			}
-			if loc.OnStack {
-				dpiece.OnStack = true
-				dpiece.StackOffset = stackOffset(slots[loc.StackLocation])
-			} else {
-				for reg := 0; reg < len(debugInfo.Registers); reg++ {
-					if loc.Registers&(1<<uint8(reg)) != 0 {
-						dpiece.RegNum = Ctxt.Arch.DWARFRegisters[debugInfo.Registers[reg].ObjNum()]
-					}
-				}
-			}
-			dloc.Pieces = append(dloc.Pieces, dpiece)
-		}
-		if present == 0 {
-			if Debug_locationlist != 0 {
-				Ctxt.Logf(" -> totally missing\n")
-			}
-			continue
-		}
-		// Extend the previous entry if possible.
-		if len(dvar.LocationList) > 0 {
-			prev := &dvar.LocationList[len(dvar.LocationList)-1]
-			if prev.EndPC == dloc.StartPC && len(prev.Pieces) == len(dloc.Pieces) {
-				equal := true
-				for i := range prev.Pieces {
-					if prev.Pieces[i] != dloc.Pieces[i] {
-						equal = false
-					}
-				}
-				if equal {
-					prev.EndPC = end
-					if Debug_locationlist != 0 {
-						Ctxt.Logf("-> merged with previous, now %#v\n", prev)
-					}
-					continue
-				}
-			}
-		}
-		dvar.LocationList = append(dvar.LocationList, dloc)
-		if Debug_locationlist != 0 {
-			Ctxt.Logf("-> added: %#v\n", dloc)
+	list := debug.LocationLists[varID]
+	if len(list) != 0 {
+		dvar.PutLocationList = func(listSym, startPC dwarf.Sym) {
+			debug.PutLocationList(list, Ctxt, listSym.(*obj.LSym), startPC.(*obj.LSym))
 		}
 	}
 	return dvar

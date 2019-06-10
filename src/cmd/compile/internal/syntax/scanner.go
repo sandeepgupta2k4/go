@@ -19,9 +19,17 @@ import (
 	"unicode/utf8"
 )
 
+// The mode flags below control which comments are reported
+// by calling the error handler. If no flag is set, comments
+// are ignored.
+const (
+	comments   uint = 1 << iota // call handler for all comments
+	directives                  // call handler for directives only
+)
+
 type scanner struct {
 	source
-	pragh  func(line, col uint, msg string)
+	mode   uint
 	nlsemi bool // if set '\n' and EOF translate to ';'
 
 	// current token, valid after calling next()
@@ -33,25 +41,36 @@ type scanner struct {
 	prec      int      // valid if tok is _Operator, _AssignOp, or _IncOp
 }
 
-func (s *scanner) init(src io.Reader, errh, pragh func(line, col uint, msg string)) {
+func (s *scanner) init(src io.Reader, errh func(line, col uint, msg string), mode uint) {
 	s.source.init(src, errh)
-	s.pragh = pragh
+	s.mode = mode
 	s.nlsemi = false
+}
+
+func (s *scanner) errorf(format string, args ...interface{}) {
+	s.error(fmt.Sprintf(format, args...))
 }
 
 // next advances the scanner by reading the next token.
 //
-// If a read, source encoding, or lexical error occurs, next
-// calls the error handler installed with init. The handler
-// must exist.
+// If a read, source encoding, or lexical error occurs, next calls
+// the installed error handler with the respective error position
+// and message. The error message is guaranteed to be non-empty and
+// never starts with a '/'. The error handler must exist.
 //
-// If a //line or //go: directive is encountered at the start
-// of a line, next calls the directive handler pragh installed
-// with init, if not nil.
+// If the scanner mode includes the comments flag and a comment
+// (including comments containing directives) is encountered, the
+// error handler is also called with each comment position and text
+// (including opening /* or // and closing */, but without a newline
+// at the end of line comments). Comment text always starts with a /
+// which can be used to distinguish these handler calls from errors.
 //
-// The (line, col) position passed to the error and directive
-// handler is always at or after the current source reading
-// position.
+// If the scanner mode includes the directives (but not the comments)
+// flag, only comments containing a //line, /*line, or //go: directive
+// are reported, in the same way as regular comments. Directives in
+// //-style comments are only recognized if they are at the beginning
+// of a line.
+//
 func (s *scanner) next() {
 	nlsemi := s.nlsemi
 	s.nlsemi = false
@@ -134,8 +153,9 @@ redo:
 
 	case '.':
 		c = s.getr()
-		if isDigit(c) {
-			s.ungetr2()
+		if isDecimal(c) {
+			s.ungetr()
+			s.unread(1) // correct position of '.' (needed by startLit in number)
 			s.number('.')
 			break
 		}
@@ -145,7 +165,7 @@ redo:
 				s.tok = _DotDotDot
 				break
 			}
-			s.ungetr2()
+			s.unread(1)
 		}
 		s.ungetr()
 		s.tok = _Dot
@@ -227,10 +247,6 @@ redo:
 		s.op, s.prec = Or, precAdd
 		goto assignop
 
-	case '~':
-		s.error("bitwise complement operator is ^")
-		fallthrough
-
 	case '^':
 		s.op, s.prec = Xor, precAdd
 		c = s.getr()
@@ -293,7 +309,7 @@ redo:
 
 	default:
 		s.tok = 0
-		s.error(fmt.Sprintf("invalid character %#U", c))
+		s.errorf("invalid character %#U", c)
 		goto redo
 	}
 
@@ -309,11 +325,7 @@ assignop:
 }
 
 func isLetter(c rune) bool {
-	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || c == '_'
-}
-
-func isDigit(c rune) bool {
-	return '0' <= c && c <= '9'
+	return 'a' <= lower(c) && lower(c) <= 'z' || c == '_'
 }
 
 func (s *scanner) ident() {
@@ -321,7 +333,7 @@ func (s *scanner) ident() {
 
 	// accelerate common case (7bit ASCII)
 	c := s.getr()
-	for isLetter(c) || isDigit(c) {
+	for isLetter(c) || isDecimal(c) {
 		c = s.getr()
 	}
 
@@ -337,7 +349,7 @@ func (s *scanner) ident() {
 
 	// possibly a keyword
 	if len(lit) >= 2 {
-		if tok := keywordMap[hash(lit)]; tok != 0 && tokstrings[tok] == string(lit) {
+		if tok := keywordMap[hash(lit)]; tok != 0 && tokStrFast(tok) == string(lit) {
 			s.nlsemi = contains(1<<_Break|1<<_Continue|1<<_Fallthrough|1<<_Return, tok)
 			s.tok = tok
 			return
@@ -349,16 +361,22 @@ func (s *scanner) ident() {
 	s.tok = _Name
 }
 
+// tokStrFast is a faster version of token.String, which assumes that tok
+// is one of the valid tokens - and can thus skip bounds checks.
+func tokStrFast(tok token) string {
+	return _token_name[_token_index[tok-1]:_token_index[tok]]
+}
+
 func (s *scanner) isIdentRune(c rune, first bool) bool {
 	switch {
 	case unicode.IsLetter(c) || c == '_':
 		// ok
 	case unicode.IsDigit(c):
 		if first {
-			s.error(fmt.Sprintf("identifier cannot begin with digit %#U", c))
+			s.errorf("identifier cannot begin with digit %#U", c)
 		}
 	case c >= utf8.RuneSelf:
-		s.error(fmt.Sprintf("invalid identifier character %#U", c))
+		s.errorf("invalid identifier character %#U", c)
 	default:
 		return false
 	}
@@ -376,7 +394,7 @@ var keywordMap [1 << 6]token // size must be power of two
 func init() {
 	// populate keywordMap
 	for tok := _Break; tok <= _Var; tok++ {
-		h := hash([]byte(tokstrings[tok]))
+		h := hash([]byte(tok.String()))
 		if keywordMap[h] != 0 {
 			panic("imperfect hash")
 		}
@@ -384,86 +402,185 @@ func init() {
 	}
 }
 
+func lower(c rune) rune     { return ('a' - 'A') | c } // returns lower-case c iff c is ASCII letter
+func isDecimal(c rune) bool { return '0' <= c && c <= '9' }
+func isHex(c rune) bool     { return '0' <= c && c <= '9' || 'a' <= lower(c) && lower(c) <= 'f' }
+
+// digits accepts the sequence { digit | '_' } starting with c0.
+// If base <= 10, digits accepts any decimal digit but records
+// the index (relative to the literal start) of a digit >= base
+// in *invalid, if *invalid < 0.
+// digits returns the first rune that is not part of the sequence
+// anymore, and a bitset describing whether the sequence contained
+// digits (bit 0 is set), or separators '_' (bit 1 is set).
+func (s *scanner) digits(c0 rune, base int, invalid *int) (c rune, digsep int) {
+	c = c0
+	if base <= 10 {
+		max := rune('0' + base)
+		for isDecimal(c) || c == '_' {
+			ds := 1
+			if c == '_' {
+				ds = 2
+			} else if c >= max && *invalid < 0 {
+				*invalid = int(s.col0 - s.col) // record invalid rune index
+			}
+			digsep |= ds
+			c = s.getr()
+		}
+	} else {
+		for isHex(c) || c == '_' {
+			ds := 1
+			if c == '_' {
+				ds = 2
+			}
+			digsep |= ds
+			c = s.getr()
+		}
+	}
+	return
+}
+
 func (s *scanner) number(c rune) {
 	s.startLit()
 
+	base := 10        // number base
+	prefix := rune(0) // one of 0 (decimal), '0' (0-octal), 'x', 'o', or 'b'
+	digsep := 0       // bit 0: digit present, bit 1: '_' present
+	invalid := -1     // index of invalid digit in literal, or < 0
+
+	// integer part
+	var ds int
 	if c != '.' {
-		s.kind = IntLit // until proven otherwise
+		s.kind = IntLit
 		if c == '0' {
 			c = s.getr()
-			if c == 'x' || c == 'X' {
-				// hex
+			switch lower(c) {
+			case 'x':
 				c = s.getr()
-				hasDigit := false
-				for isDigit(c) || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F' {
-					c = s.getr()
-					hasDigit = true
-				}
-				if !hasDigit {
-					s.error("malformed hex constant")
-				}
-				goto done
-			}
-
-			// decimal 0, octal, or float
-			has8or9 := false
-			for isDigit(c) {
-				if c > '7' {
-					has8or9 = true
-				}
+				base, prefix = 16, 'x'
+			case 'o':
 				c = s.getr()
-			}
-			if c != '.' && c != 'e' && c != 'E' && c != 'i' {
-				// octal
-				if has8or9 {
-					s.error("malformed octal constant")
-				}
-				goto done
-			}
-
-		} else {
-			// decimal or float
-			for isDigit(c) {
+				base, prefix = 8, 'o'
+			case 'b':
 				c = s.getr()
+				base, prefix = 2, 'b'
+			default:
+				base, prefix = 8, '0'
+				digsep = 1 // leading 0
 			}
 		}
+		c, ds = s.digits(c, base, &invalid)
+		digsep |= ds
 	}
 
-	// float
+	// fractional part
 	if c == '.' {
 		s.kind = FloatLit
-		c = s.getr()
-		for isDigit(c) {
-			c = s.getr()
+		if prefix == 'o' || prefix == 'b' {
+			s.error("invalid radix point in " + litname(prefix))
 		}
+		c, ds = s.digits(s.getr(), base, &invalid)
+		digsep |= ds
+	}
+
+	if digsep&1 == 0 {
+		s.error(litname(prefix) + " has no digits")
 	}
 
 	// exponent
-	if c == 'e' || c == 'E' {
-		s.kind = FloatLit
+	if e := lower(c); e == 'e' || e == 'p' {
+		switch {
+		case e == 'e' && prefix != 0 && prefix != '0':
+			s.errorf("%q exponent requires decimal mantissa", c)
+		case e == 'p' && prefix != 'x':
+			s.errorf("%q exponent requires hexadecimal mantissa", c)
+		}
 		c = s.getr()
-		if c == '-' || c == '+' {
+		s.kind = FloatLit
+		if c == '+' || c == '-' {
 			c = s.getr()
 		}
-		if !isDigit(c) {
-			s.error("malformed floating-point constant exponent")
+		c, ds = s.digits(c, 10, nil)
+		digsep |= ds
+		if ds&1 == 0 {
+			s.error("exponent has no digits")
 		}
-		for isDigit(c) {
-			c = s.getr()
-		}
+	} else if prefix == 'x' && s.kind == FloatLit {
+		s.error("hexadecimal mantissa requires a 'p' exponent")
 	}
 
-	// complex
+	// suffix 'i'
 	if c == 'i' {
 		s.kind = ImagLit
-		s.getr()
+		c = s.getr()
 	}
-
-done:
 	s.ungetr()
+
 	s.nlsemi = true
 	s.lit = string(s.stopLit())
 	s.tok = _Literal
+
+	if s.kind == IntLit && invalid >= 0 {
+		s.errh(s.line, s.col+uint(invalid), fmt.Sprintf("invalid digit %q in %s", s.lit[invalid], litname(prefix)))
+	}
+
+	if digsep&2 != 0 {
+		if i := invalidSep(s.lit); i >= 0 {
+			s.errh(s.line, s.col+uint(i), "'_' must separate successive digits")
+		}
+	}
+}
+
+func litname(prefix rune) string {
+	switch prefix {
+	case 'x':
+		return "hexadecimal literal"
+	case 'o', '0':
+		return "octal literal"
+	case 'b':
+		return "binary literal"
+	}
+	return "decimal literal"
+}
+
+// invalidSep returns the index of the first invalid separator in x, or -1.
+func invalidSep(x string) int {
+	x1 := ' ' // prefix char, we only care if it's 'x'
+	d := '.'  // digit, one of '_', '0' (a digit), or '.' (anything else)
+	i := 0
+
+	// a prefix counts as a digit
+	if len(x) >= 2 && x[0] == '0' {
+		x1 = lower(rune(x[1]))
+		if x1 == 'x' || x1 == 'o' || x1 == 'b' {
+			d = '0'
+			i = 2
+		}
+	}
+
+	// mantissa and exponent
+	for ; i < len(x); i++ {
+		p := d // previous digit
+		d = rune(x[i])
+		switch {
+		case d == '_':
+			if p != '0' {
+				return i
+			}
+		case isDecimal(d) || x1 == 'x' && isHex(d):
+			d = '0'
+		default:
+			if p == '_' {
+				return i - 1
+			}
+			d = '.'
+		}
+	}
+	if d == '_' {
+		return len(x) - 1
+	}
+
+	return -1
 }
 
 func (s *scanner) rune() {
@@ -565,6 +682,10 @@ func (s *scanner) rawString() {
 	s.tok = _Literal
 }
 
+func (s *scanner) comment(text string) {
+	s.errh(s.line, s.col, text)
+}
+
 func (s *scanner) skipLine(r rune) {
 	for r >= 0 {
 		if r == '\n' {
@@ -577,14 +698,21 @@ func (s *scanner) skipLine(r rune) {
 
 func (s *scanner) lineComment() {
 	r := s.getr()
+
+	if s.mode&comments != 0 {
+		s.startLit()
+		s.skipLine(r)
+		s.comment("//" + string(s.stopLit()))
+		return
+	}
+
 	// directives must start at the beginning of the line (s.col == colbase)
-	if s.col != colbase || s.pragh == nil || (r != 'g' && r != 'l') {
+	if s.mode&directives == 0 || s.col != colbase || (r != 'g' && r != 'l') {
 		s.skipLine(r)
 		return
 	}
-	// s.col == colbase && s.pragh != nil && (r == 'g' || r == 'l')
 
-	// recognize directives
+	// recognize go: or line directives
 	prefix := "go:"
 	if r == 'l' {
 		prefix = "line "
@@ -597,30 +725,60 @@ func (s *scanner) lineComment() {
 		r = s.getr()
 	}
 
-	// directive text without line ending (which may be "\r\n" if Windows),
+	// directive text
 	s.startLit()
 	s.skipLine(r)
-	text := s.stopLit()
-	if i := len(text) - 1; i >= 0 && text[i] == '\r' {
-		text = text[:i]
-	}
-
-	s.pragh(s.line, s.col+2, prefix+string(text)) // +2 since directive text starts after //
+	s.comment("//" + prefix + string(s.stopLit()))
 }
 
-func (s *scanner) fullComment() {
-	for {
-		r := s.getr()
+func (s *scanner) skipComment(r rune) bool {
+	for r >= 0 {
 		for r == '*' {
 			r = s.getr()
 			if r == '/' {
-				return
+				return true
 			}
 		}
-		if r < 0 {
-			s.errh(s.line, s.col, "comment not terminated")
+		r = s.getr()
+	}
+	s.errh(s.line, s.col, "comment not terminated")
+	return false
+}
+
+func (s *scanner) fullComment() {
+	r := s.getr()
+
+	if s.mode&comments != 0 {
+		s.startLit()
+		if s.skipComment(r) {
+			s.comment("/*" + string(s.stopLit()))
+		} else {
+			s.killLit() // not a complete comment - ignore
+		}
+		return
+	}
+
+	if s.mode&directives == 0 || r != 'l' {
+		s.skipComment(r)
+		return
+	}
+
+	// recognize line directive
+	const prefix = "line "
+	for _, m := range prefix {
+		if r != m {
+			s.skipComment(r)
 			return
 		}
+		r = s.getr()
+	}
+
+	// directive text
+	s.startLit()
+	if s.skipComment(r) {
+		s.comment("/*" + prefix + string(s.stopLit()))
+	} else {
+		s.killLit() // not a complete comment - ignore
 	}
 }
 
@@ -655,12 +813,10 @@ func (s *scanner) escape(quote rune) bool {
 	for i := n; i > 0; i-- {
 		d := base
 		switch {
-		case isDigit(c):
+		case isDecimal(c):
 			d = uint32(c) - '0'
-		case 'a' <= c && c <= 'f':
-			d = uint32(c) - ('a' - 10)
-		case 'A' <= c && c <= 'F':
-			d = uint32(c) - ('A' - 10)
+		case 'a' <= lower(c) && lower(c) <= 'f':
+			d = uint32(lower(c)) - ('a' - 10)
 		}
 		if d >= base {
 			if c < 0 {
@@ -670,7 +826,7 @@ func (s *scanner) escape(quote rune) bool {
 			if base == 8 {
 				kind = "octal"
 			}
-			s.error(fmt.Sprintf("non-%s character in escape sequence: %c", kind, c))
+			s.errorf("non-%s character in escape sequence: %c", kind, c)
 			s.ungetr()
 			return false
 		}
@@ -681,7 +837,7 @@ func (s *scanner) escape(quote rune) bool {
 	s.ungetr()
 
 	if x > max && base == 8 {
-		s.error(fmt.Sprintf("octal escape value > 255: %d", x))
+		s.errorf("octal escape value > 255: %d", x)
 		return false
 	}
 

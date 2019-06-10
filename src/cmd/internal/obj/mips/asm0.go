@@ -92,6 +92,8 @@ var optab = []Optab{
 	{AADDV, C_REG, C_NONE, C_REG, 2, 4, 0, sys.MIPS64},
 	{AAND, C_REG, C_NONE, C_REG, 2, 4, 0, 0},
 	{ACMOVN, C_REG, C_REG, C_REG, 2, 4, 0, 0},
+	{ANEGW, C_REG, C_NONE, C_REG, 2, 4, 0, 0},
+	{ANEGV, C_REG, C_NONE, C_REG, 2, 4, 0, sys.MIPS64},
 
 	{ASLL, C_REG, C_NONE, C_REG, 9, 4, 0, 0},
 	{ASLL, C_REG, C_REG, C_REG, 9, 4, 0, 0},
@@ -610,13 +612,11 @@ func (c *ctxt0) aclass(a *obj.Addr) int {
 				return C_DACON
 			}
 
-			goto consize
-
 		case obj.NAME_EXTERN,
 			obj.NAME_STATIC:
 			s := a.Sym
 			if s == nil {
-				break
+				return C_GOK
 			}
 
 			c.instoffset = a.Offset
@@ -648,11 +648,11 @@ func (c *ctxt0) aclass(a *obj.Addr) int {
 				return C_SACON
 			}
 			return C_LACON
+
+		default:
+			return C_GOK
 		}
 
-		return C_GOK
-
-	consize:
 		if c.instoffset >= 0 {
 			if c.instoffset == 0 {
 				return C_ZCON
@@ -722,8 +722,6 @@ func (c *ctxt0) oplook(p *obj.Prog) *Optab {
 		a2 = C_REG
 	}
 
-	//print("oplook %P %d %d %d\n", p, a1, a2, a3);
-
 	ops := oprange[p.As&obj.AMask]
 	c1 := &xcmp[a1]
 	c3 := &xcmp[a3]
@@ -737,10 +735,8 @@ func (c *ctxt0) oplook(p *obj.Prog) *Optab {
 
 	c.ctxt.Diag("illegal combination %v %v %v %v", p.As, DRconv(a1), DRconv(a2), DRconv(a3))
 	prasm(p)
-	if ops == nil {
-		ops = optab
-	}
-	return &ops[0]
+	// Turn illegal instruction into an UNDEF, avoid crashing in asmout.
+	return &Optab{obj.AUNDEF, C_NONE, C_NONE, C_NONE, 49, 4, 0, 0}
 }
 
 func cmp(a int, b int) bool {
@@ -961,6 +957,8 @@ func buildop(ctxt *obj.Link) {
 			opset(ADIVU, r0)
 			opset(AMULU, r0)
 			opset(ADIV, r0)
+			opset(AMADD, r0)
+			opset(AMSUB, r0)
 
 		case AMULV:
 			opset(ADIVV, r0)
@@ -1021,6 +1019,8 @@ func buildop(ctxt *obj.Link) {
 			ALLV,
 			ASC,
 			ASCV,
+			ANEGW,
+			ANEGV,
 			AWORD,
 			obj.ANOP,
 			obj.ATEXT,
@@ -1120,13 +1120,17 @@ func (c *ctxt0) asmout(p *obj.Prog, o *Optab, out []uint32) {
 	case 1: /* mov r1,r2 ==> OR r1,r0,r2 */
 		a := AOR
 		if p.As == AMOVW && c.ctxt.Arch.Family == sys.MIPS64 {
-			a = AADDU // sign-extended to high 32 bits
+			// on MIPS64, most of the 32-bit instructions have unpredictable behavior,
+			// but SLL is special that the result is always sign-extended to 64-bit.
+			a = ASLL
 		}
-		o1 = OP_RRR(c.oprrr(a), uint32(REGZERO), uint32(p.From.Reg), uint32(p.To.Reg))
+		o1 = OP_RRR(c.oprrr(a), uint32(p.From.Reg), uint32(REGZERO), uint32(p.To.Reg))
 
 	case 2: /* add/sub r1,[r2],r3 */
 		r := int(p.Reg)
-
+		if p.As == ANEGW || p.As == ANEGV {
+			r = REGZERO
+		}
 		if r == 0 {
 			r = int(p.To.Reg)
 		}
@@ -1273,7 +1277,7 @@ func (c *ctxt0) asmout(p *obj.Prog, o *Optab, out []uint32) {
 			r = REGZERO
 		}
 		/* only use 10 bits of trap code */
-		o1 = OP_IRR(c.opirr(p.As), (uint32(v)&0x3FF)<<6, uint32(p.Reg), uint32(p.To.Reg))
+		o1 = OP_IRR(c.opirr(p.As), (uint32(v)&0x3FF)<<6, uint32(r), uint32(p.To.Reg))
 
 	case 16: /* sll $c,[r1],r2 */
 		v := c.regoff(&p.From)
@@ -1595,7 +1599,6 @@ func (c *ctxt0) asmout(p *obj.Prog, o *Optab, out []uint32) {
 	out[1] = o2
 	out[2] = o3
 	out[3] = o4
-	return
 }
 
 func (c *ctxt0) vregoff(a *obj.Addr) int64 {
@@ -1626,7 +1629,7 @@ func (c *ctxt0) oprrr(a obj.As) uint32 {
 		return OP(4, 6)
 	case ASUB:
 		return OP(4, 2)
-	case ASUBU:
+	case ASUBU, ANEGW:
 		return OP(4, 3)
 	case ANOR:
 		return OP(4, 7)
@@ -1648,7 +1651,7 @@ func (c *ctxt0) oprrr(a obj.As) uint32 {
 		return OP(5, 5)
 	case ASUBV:
 		return OP(5, 6)
-	case ASUBVU:
+	case ASUBVU, ANEGV:
 		return OP(5, 7)
 	case AREM,
 		ADIV:
@@ -1782,6 +1785,10 @@ func (c *ctxt0) oprrr(a obj.As) uint32 {
 		return SP(3, 4) | OP(4, 1)
 	case ACLZ:
 		return SP(3, 4) | OP(4, 0)
+	case AMADD:
+		return SP(3, 4) | OP(0, 0)
+	case AMSUB:
+		return SP(3, 4) | OP(0, 4)
 	}
 
 	if a < 0 {

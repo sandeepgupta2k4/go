@@ -2,12 +2,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build darwin dragonfly freebsd netbsd openbsd
+// +build dragonfly freebsd netbsd openbsd
 
 package syscall
 
 import (
-	"runtime"
 	"unsafe"
 )
 
@@ -43,7 +42,7 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 	// Declare all variables at top in case any
 	// declarations require heap allocation (e.g., err1).
 	var (
-		r1, r2 uintptr
+		r1     uintptr
 		err1   Errno
 		nextfd int
 		i      int
@@ -62,23 +61,13 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 	}
 	nextfd++
 
-	darwin := runtime.GOOS == "darwin"
-
 	// About to call fork.
 	// No more allocation or calls of non-assembly functions.
 	runtime_BeforeFork()
-	r1, r2, err1 = RawSyscall(SYS_FORK, 0, 0, 0)
+	r1, _, err1 = RawSyscall(SYS_FORK, 0, 0, 0)
 	if err1 != 0 {
 		runtime_AfterFork()
 		return 0, err1
-	}
-
-	// On Darwin:
-	//	r1 = child pid in both parent and child.
-	//	r2 = 0 in parent, 1 in child.
-	// Convert to normal Unix r1 = 0 in child.
-	if darwin && r2 == 1 {
-		r1 = 0
 	}
 
 	if r1 != 0 {
@@ -173,6 +162,22 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 		}
 	}
 
+	// Detach fd 0 from tty
+	if sys.Noctty {
+		_, _, err1 = RawSyscall(SYS_IOCTL, 0, uintptr(TIOCNOTTY), 0)
+		if err1 != 0 {
+			goto childerror
+		}
+	}
+
+	// Set the controlling TTY to Ctty
+	if sys.Setctty {
+		_, _, err1 = RawSyscall(SYS_IOCTL, uintptr(sys.Ctty), uintptr(TIOCSCTTY), 0)
+		if err1 != 0 {
+			goto childerror
+		}
+	}
+
 	// Pass 1: look for fd[i] < i and move those up above len(fd)
 	// so that pass 2 won't stomp on an fd it needs later.
 	if pipe < nextfd {
@@ -228,22 +233,6 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 	// to set them close-on-exec.
 	for i = len(fd); i < 3; i++ {
 		RawSyscall(SYS_CLOSE, uintptr(i), 0, 0)
-	}
-
-	// Detach fd 0 from tty
-	if sys.Noctty {
-		_, _, err1 = RawSyscall(SYS_IOCTL, 0, uintptr(TIOCNOTTY), 0)
-		if err1 != 0 {
-			goto childerror
-		}
-	}
-
-	// Set the controlling TTY to Ctty
-	if sys.Setctty {
-		_, _, err1 = RawSyscall(SYS_IOCTL, uintptr(sys.Ctty), uintptr(TIOCSCTTY), 0)
-		if err1 != 0 {
-			goto childerror
-		}
 	}
 
 	// Time to exec.

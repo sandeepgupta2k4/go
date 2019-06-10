@@ -17,6 +17,7 @@ const (
 	_MAP_ANON    = 0x1000
 	_MAP_PRIVATE = 0x2
 	_MAP_FIXED   = 0x10
+	_MAP_STACK   = 0x4000
 
 	_MADV_FREE = 0x6
 
@@ -133,12 +134,9 @@ type timespec struct {
 	tv_nsec int32
 }
 
-func (ts *timespec) set_sec(x int64) {
-	ts.tv_sec = x
-}
-
-func (ts *timespec) set_nsec(x int32) {
-	ts.tv_nsec = x
+//go:nosplit
+func (ts *timespec) setNsec(ns int64) {
+	ts.tv_sec = int64(timediv(ns, 1e9, &ts.tv_nsec))
 }
 
 type timeval struct {

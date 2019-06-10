@@ -5,6 +5,7 @@
 package runtime
 
 import (
+	"internal/cpu"
 	"runtime/internal/atomic"
 	"runtime/internal/sys"
 	"unsafe"
@@ -21,6 +22,13 @@ const (
 	// If you add to this list, add to the list
 	// of "okay during garbage collection" status
 	// in mgcmark.go too.
+	//
+	// TODO(austin): The _Gscan bit could be much lighter-weight.
+	// For example, we could choose not to run _Gscanrunnable
+	// goroutines found in the run queue, rather than CAS-looping
+	// until they become _Grunnable. And transitions like
+	// _Gscanwaiting -> _Gscanrunnable are actually okay because
+	// they don't affect stack ownership.
 
 	// _Gidle means this goroutine was just allocated and has not
 	// yet been initialized.
@@ -90,10 +98,51 @@ const (
 
 const (
 	// P status
-	_Pidle    = iota
-	_Prunning // Only this P is allowed to change from _Prunning.
+
+	// _Pidle means a P is not being used to run user code or the
+	// scheduler. Typically, it's on the idle P list and available
+	// to the scheduler, but it may just be transitioning between
+	// other states.
+	//
+	// The P is owned by the idle list or by whatever is
+	// transitioning its state. Its run queue is empty.
+	_Pidle = iota
+
+	// _Prunning means a P is owned by an M and is being used to
+	// run user code or the scheduler. Only the M that owns this P
+	// is allowed to change the P's status from _Prunning. The M
+	// may transition the P to _Pidle (if it has no more work to
+	// do), _Psyscall (when entering a syscall), or _Pgcstop (to
+	// halt for the GC). The M may also hand ownership of the P
+	// off directly to another M (e.g., to schedule a locked G).
+	_Prunning
+
+	// _Psyscall means a P is not running user code. It has
+	// affinity to an M in a syscall but is not owned by it and
+	// may be stolen by another M. This is similar to _Pidle but
+	// uses lightweight transitions and maintains M affinity.
+	//
+	// Leaving _Psyscall must be done with a CAS, either to steal
+	// or retake the P. Note that there's an ABA hazard: even if
+	// an M successfully CASes its original P back to _Prunning
+	// after a syscall, it must understand the P may have been
+	// used by another M in the interim.
 	_Psyscall
+
+	// _Pgcstop means a P is halted for STW and owned by the M
+	// that stopped the world. The M that stopped the world
+	// continues to use its P, even in _Pgcstop. Transitioning
+	// from _Prunning to _Pgcstop causes an M to release its P and
+	// park.
+	//
+	// The P retains its run queue and startTheWorld will restart
+	// the scheduler on Ps with non-empty run queues.
 	_Pgcstop
+
+	// _Pdead means a P is no longer used (GOMAXPROCS shrank). We
+	// reuse Ps if GOMAXPROCS increases. A dead P is mostly
+	// stripped of its resources, though a few things remain
+	// (e.g., trace buffers).
 	_Pdead
 )
 
@@ -358,28 +407,29 @@ type g struct {
 	atomicstatus   uint32
 	stackLock      uint32 // sigprof/scang lock; TODO: fold in to atomicstatus
 	goid           int64
-	waitsince      int64  // approx time when the g become blocked
-	waitreason     string // if status==Gwaiting
 	schedlink      guintptr
-	preempt        bool     // preemption signal, duplicates stackguard0 = stackpreempt
-	paniconfault   bool     // panic (instead of crash) on unexpected fault address
-	preemptscan    bool     // preempted g does scan for gc
-	gcscandone     bool     // g has scanned stack; protected by _Gscan bit in status
-	gcscanvalid    bool     // false at start of gc cycle, true if G has not run since last scan; TODO: remove?
-	throwsplit     bool     // must not split stack
-	raceignore     int8     // ignore race detection events
-	sysblocktraced bool     // StartTrace has emitted EvGoInSyscall about this goroutine
-	sysexitticks   int64    // cputicks when syscall has returned (for tracing)
-	traceseq       uint64   // trace event sequencer
-	tracelastp     puintptr // last P emitted an event for this goroutine
+	waitsince      int64      // approx time when the g become blocked
+	waitreason     waitReason // if status==Gwaiting
+	preempt        bool       // preemption signal, duplicates stackguard0 = stackpreempt
+	paniconfault   bool       // panic (instead of crash) on unexpected fault address
+	preemptscan    bool       // preempted g does scan for gc
+	gcscandone     bool       // g has scanned stack; protected by _Gscan bit in status
+	gcscanvalid    bool       // false at start of gc cycle, true if G has not run since last scan; TODO: remove?
+	throwsplit     bool       // must not split stack
+	raceignore     int8       // ignore race detection events
+	sysblocktraced bool       // StartTrace has emitted EvGoInSyscall about this goroutine
+	sysexitticks   int64      // cputicks when syscall has returned (for tracing)
+	traceseq       uint64     // trace event sequencer
+	tracelastp     puintptr   // last P emitted an event for this goroutine
 	lockedm        muintptr
 	sig            uint32
 	writebuf       []byte
 	sigcode0       uintptr
 	sigcode1       uintptr
 	sigpc          uintptr
-	gopc           uintptr // pc of go statement that created this goroutine
-	startpc        uintptr // pc of goroutine function
+	gopc           uintptr         // pc of go statement that created this goroutine
+	ancestors      *[]ancestorInfo // ancestor information goroutine(s) that created this goroutine (only used if debug.tracebackancestors)
+	startpc        uintptr         // pc of goroutine function
 	racectx        uintptr
 	waiting        *sudog         // sudog structures this g is waiting on (that have a valid elem ptr); in lock order
 	cgoCtxt        []uintptr      // cgo traceback context
@@ -415,18 +465,16 @@ type m struct {
 	caughtsig     guintptr // goroutine running during fatal signal
 	p             puintptr // attached p for executing go code (nil if not executing go code)
 	nextp         puintptr
+	oldp          puintptr // the p that was attached before executing a syscall
 	id            int64
 	mallocing     int32
 	throwing      int32
 	preemptoff    string // if != "", keep curg running on this m
 	locks         int32
-	softfloat     int32
 	dying         int32
 	profilehz     int32
-	helpgc        int32
 	spinning      bool // m is out of work and is actively looking for work
 	blocked       bool // m is blocked on a note
-	inwb          bool // m is executing a write barrier
 	newSigstack   bool // minit on C thread called sigaltstack
 	printlock     int8
 	incgo         bool   // m is executing a cgo call
@@ -443,14 +491,11 @@ type m struct {
 	schedlink     muintptr
 	mcache        *mcache
 	lockedg       guintptr
-	createstack   [32]uintptr    // stack that created this thread.
-	freglo        [16]uint32     // d[i] lsb and f[i]
-	freghi        [16]uint32     // d[i] msb and f[i+16]
-	fflag         uint32         // floating point compare flags
-	lockedExt     uint32         // tracking for external LockOSThread
-	lockedInt     uint32         // tracking for internal lockOSThread
-	nextwaitm     muintptr       // next m waiting for lock
-	waitunlockf   unsafe.Pointer // todo go func(*g, unsafe.pointer) bool
+	createstack   [32]uintptr // stack that created this thread.
+	lockedExt     uint32      // tracking for external LockOSThread
+	lockedInt     uint32      // tracking for internal lockOSThread
+	nextwaitm     muintptr    // next m waiting for lock
+	waitunlockf   func(*g, unsafe.Pointer) bool
 	waitlock      unsafe.Pointer
 	waittraceev   byte
 	waittraceskip int
@@ -467,12 +512,15 @@ type m struct {
 	libcallg  guintptr
 	syscall   libcall // stores syscall parameters on windows
 
+	vdsoSP uintptr // SP for traceback while in VDSO call (0 if not in call)
+	vdsoPC uintptr // PC for traceback while in VDSO call
+
+	dlogPerM
+
 	mOS
 }
 
 type p struct {
-	lock mutex
-
 	id          int32
 	status      uint32 // one of pidle/prunning/...
 	link        puintptr
@@ -481,7 +529,7 @@ type p struct {
 	sysmontick  sysmontick // last tick observed by sysmon
 	m           muintptr   // back-link to associated m (nil if idle)
 	mcache      *mcache
-	racectx     uintptr
+	raceprocctx uintptr
 
 	deferpool    [5][]*_defer // pool of available defer structs of different sizes (see panic.go)
 	deferpoolbuf [5][32]*_defer
@@ -506,8 +554,10 @@ type p struct {
 	runnext guintptr
 
 	// Available G's (status == Gdead)
-	gfree    *g
-	gfreecnt int32
+	gFree struct {
+		gList
+		n int32
+	}
 
 	sudogcache []*sudog
 	sudogbuf   [128]*sudog
@@ -524,10 +574,12 @@ type p struct {
 
 	palloc persistentAlloc // per-P to avoid mutex
 
+	_ uint32 // Alignment for atomic fields below
+
 	// Per-P GC state
-	gcAssistTime         int64 // Nanoseconds in assistAlloc
-	gcFractionalMarkTime int64 // Nanoseconds in fractional mark worker
-	gcBgMarkWorker       guintptr
+	gcAssistTime         int64    // Nanoseconds in assistAlloc
+	gcFractionalMarkTime int64    // Nanoseconds in fractional mark worker (atomic)
+	gcBgMarkWorker       guintptr // (atomic)
 	gcMarkWorkerMode     gcMarkWorkerMode
 
 	// gcMarkWorkerStartTime is the nanotime() at which this mark
@@ -546,7 +598,7 @@ type p struct {
 
 	runSafePointFn uint32 // if 1, run sched.safePointFn at next safe point
 
-	pad [sys.CacheLineSize]byte
+	pad cpu.CacheLinePad
 }
 
 type schedt struct {
@@ -574,15 +626,28 @@ type schedt struct {
 	nmspinning uint32 // See "Worker thread parking/unparking" comment in proc.go.
 
 	// Global runnable queue.
-	runqhead guintptr
-	runqtail guintptr
+	runq     gQueue
 	runqsize int32
 
+	// disable controls selective disabling of the scheduler.
+	//
+	// Use schedEnableUser to control this.
+	//
+	// disable is protected by sched.lock.
+	disable struct {
+		// user disables scheduling of user goroutines.
+		user     bool
+		runnable gQueue // pending runnable Gs
+		n        int32  // length of runnable
+	}
+
 	// Global cache of dead G's.
-	gflock       mutex
-	gfreeStack   *g
-	gfreeNoStack *g
-	ngfree       int32
+	gFree struct {
+		lock    mutex
+		stack   gList // Gs with stacks
+		noStack gList // Gs without stacks
+		n       int32
+	}
 
 	// Central cache of sudog structs.
 	sudoglock  mutex
@@ -635,14 +700,27 @@ type _func struct {
 	entry   uintptr // start pc
 	nameoff int32   // function name
 
-	args int32 // in/out args size
-	_    int32 // previously legacy frame size; kept for layout compatibility
+	args        int32  // in/out args size
+	deferreturn uint32 // offset of a deferreturn block from entry, if any.
 
 	pcsp      int32
 	pcfile    int32
 	pcln      int32
 	npcdata   int32
-	nfuncdata int32
+	funcID    funcID  // set for certain special runtime functions
+	_         [2]int8 // unused
+	nfuncdata uint8   // must be last
+}
+
+// Pseudo-Func that is returned for PCs that occur in inlined code.
+// A *Func can be either a *_func or a *funcinl, and they are distinguished
+// by the first uintptr.
+type funcinl struct {
+	zero  uintptr // set to 0 to distinguish from _func
+	entry uintptr // entry of the real (the "outermost") frame.
+	name  string
+	file  string
+	line  int
 }
 
 // layout of Itab known to compilers
@@ -658,7 +736,7 @@ type itab struct {
 }
 
 // Lock-free stack node.
-// // Also known to export_test.go.
+// Also known to export_test.go.
 type lfnode struct {
 	next    uint64
 	pushcnt uintptr
@@ -707,7 +785,17 @@ type _defer struct {
 	link    *_defer
 }
 
-// panics
+// A _panic holds information about an active panic.
+//
+// This is marked go:notinheap because _panic values must only ever
+// live on the stack.
+//
+// The argp and link fields are stack pointers, but don't need special
+// handling during stack growth: because they are pointer-typed and
+// _panic values only live on the stack, regular stack pointer
+// adjustment takes care of them.
+//
+//go:notinheap
 type _panic struct {
 	argp      unsafe.Pointer // pointer to arguments of deferred call run during panic; cannot move - known to liblink
 	arg       interface{}    // argument to panic
@@ -730,6 +818,13 @@ type stkframe struct {
 	argmap   *bitvector // force use of this argmap
 }
 
+// ancestorInfo records details of where a goroutine was started.
+type ancestorInfo struct {
+	pcs  []uintptr // pcs from the stack of this goroutine
+	goid int64     // goroutine id of this goroutine; original goroutine possibly dead
+	gopc uintptr   // pc of go statement that created this goroutine
+}
+
 const (
 	_TraceRuntimeFrames = 1 << iota // include frames for internal runtime functions.
 	_TraceTrap                      // the initial PC, SP are from a trap, not a return PC from a call
@@ -738,6 +833,73 @@ const (
 
 // The maximum number of frames we print for a traceback
 const _TracebackMaxFrames = 100
+
+// A waitReason explains why a goroutine has been stopped.
+// See gopark. Do not re-use waitReasons, add new ones.
+type waitReason uint8
+
+const (
+	waitReasonZero                  waitReason = iota // ""
+	waitReasonGCAssistMarking                         // "GC assist marking"
+	waitReasonIOWait                                  // "IO wait"
+	waitReasonChanReceiveNilChan                      // "chan receive (nil chan)"
+	waitReasonChanSendNilChan                         // "chan send (nil chan)"
+	waitReasonDumpingHeap                             // "dumping heap"
+	waitReasonGarbageCollection                       // "garbage collection"
+	waitReasonGarbageCollectionScan                   // "garbage collection scan"
+	waitReasonPanicWait                               // "panicwait"
+	waitReasonSelect                                  // "select"
+	waitReasonSelectNoCases                           // "select (no cases)"
+	waitReasonGCAssistWait                            // "GC assist wait"
+	waitReasonGCSweepWait                             // "GC sweep wait"
+	waitReasonGCScavengeWait                          // "GC scavenge wait"
+	waitReasonChanReceive                             // "chan receive"
+	waitReasonChanSend                                // "chan send"
+	waitReasonFinalizerWait                           // "finalizer wait"
+	waitReasonForceGGIdle                             // "force gc (idle)"
+	waitReasonSemacquire                              // "semacquire"
+	waitReasonSleep                                   // "sleep"
+	waitReasonSyncCondWait                            // "sync.Cond.Wait"
+	waitReasonTimerGoroutineIdle                      // "timer goroutine (idle)"
+	waitReasonTraceReaderBlocked                      // "trace reader (blocked)"
+	waitReasonWaitForGCCycle                          // "wait for GC cycle"
+	waitReasonGCWorkerIdle                            // "GC worker (idle)"
+)
+
+var waitReasonStrings = [...]string{
+	waitReasonZero:                  "",
+	waitReasonGCAssistMarking:       "GC assist marking",
+	waitReasonIOWait:                "IO wait",
+	waitReasonChanReceiveNilChan:    "chan receive (nil chan)",
+	waitReasonChanSendNilChan:       "chan send (nil chan)",
+	waitReasonDumpingHeap:           "dumping heap",
+	waitReasonGarbageCollection:     "garbage collection",
+	waitReasonGarbageCollectionScan: "garbage collection scan",
+	waitReasonPanicWait:             "panicwait",
+	waitReasonSelect:                "select",
+	waitReasonSelectNoCases:         "select (no cases)",
+	waitReasonGCAssistWait:          "GC assist wait",
+	waitReasonGCSweepWait:           "GC sweep wait",
+	waitReasonGCScavengeWait:        "GC scavenge wait",
+	waitReasonChanReceive:           "chan receive",
+	waitReasonChanSend:              "chan send",
+	waitReasonFinalizerWait:         "finalizer wait",
+	waitReasonForceGGIdle:           "force gc (idle)",
+	waitReasonSemacquire:            "semacquire",
+	waitReasonSleep:                 "sleep",
+	waitReasonSyncCondWait:          "sync.Cond.Wait",
+	waitReasonTimerGoroutineIdle:    "timer goroutine (idle)",
+	waitReasonTraceReaderBlocked:    "trace reader (blocked)",
+	waitReasonWaitForGCCycle:        "wait for GC cycle",
+	waitReasonGCWorkerIdle:          "GC worker (idle)",
+}
+
+func (w waitReason) String() string {
+	if w < 0 || w >= waitReason(len(waitReasonStrings)) {
+		return "unknown wait reason"
+	}
+	return waitReasonStrings[w]
+}
 
 var (
 	allglen    uintptr
@@ -751,24 +913,12 @@ var (
 	newprocs   int32
 
 	// Information about what cpu features are available.
-	// Set on startup in asm_{386,amd64,amd64p32}.s.
 	// Packages outside the runtime should not use these
 	// as they are not an external api.
+	// Set on startup in asm_{386,amd64,amd64p32}.s
 	processorVersionInfo uint32
 	isIntel              bool
 	lfenceBeforeRdtsc    bool
-	support_aes          bool
-	support_avx          bool
-	support_avx2         bool
-	support_bmi1         bool
-	support_bmi2         bool
-	support_erms         bool
-	support_osxsave      bool
-	support_popcnt       bool
-	support_sse2         bool
-	support_sse41        bool
-	support_sse42        bool
-	support_ssse3        bool
 
 	goarm                uint8 // set by cmd/link on arm systems
 	framepointer_enabled bool  // set by cmd/link

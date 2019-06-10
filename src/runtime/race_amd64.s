@@ -23,7 +23,7 @@
 // Arguments are passed in CX, DX, R8, R9, the rest is on stack.
 // Callee-saved registers are: BX, BP, DI, SI, R12-R15.
 // SP must be 16-byte aligned. Windows also requires "stack-backing" for the 4 register arguments:
-// http://msdn.microsoft.com/en-us/library/ms235286.aspx
+// https://msdn.microsoft.com/en-us/library/ms235286.aspx
 // We do not do this, because it seems to be intended for vararg/unprototyped functions.
 // Gcc-compiled race runtime does not try to use that space.
 
@@ -398,7 +398,7 @@ TEXT	runtime·racecallbackthunk(SB), NOSPLIT, $56-8
 	MOVQ	g(RARG0), RARG0
 	MOVQ	g_m(RARG0), RARG0
 	MOVQ	m_p(RARG0), RARG0
-	MOVQ	p_racectx(RARG0), RARG0
+	MOVQ	p_raceprocctx(RARG0), RARG0
 	MOVQ	RARG0, (RARG1)
 	RET
 

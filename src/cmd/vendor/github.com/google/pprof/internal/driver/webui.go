@@ -69,31 +69,24 @@ func (ec *errorCatcher) PrintErr(args ...interface{}) {
 
 // webArgs contains arguments passed to templates in webhtml.go.
 type webArgs struct {
-	BaseURL  string
-	Title    string
-	Errors   []string
-	Total    int64
-	Legend   []string
-	Help     map[string]string
-	Nodes    []string
-	HTMLBody template.HTML
-	TextBody string
-	Top      []report.TextItem
+	Title       string
+	Errors      []string
+	Total       int64
+	SampleTypes []string
+	Legend      []string
+	Help        map[string]string
+	Nodes       []string
+	HTMLBody    template.HTML
+	TextBody    string
+	Top         []report.TextItem
+	FlameGraph  template.JS
 }
 
-func serveWebInterface(hostport string, p *profile.Profile, o *plugin.Options) error {
-	host, portStr, err := net.SplitHostPort(hostport)
+func serveWebInterface(hostport string, p *profile.Profile, o *plugin.Options, disableBrowser bool) error {
+	host, port, err := getHostAndPort(hostport)
 	if err != nil {
-		return fmt.Errorf("could not split http address: %v", err)
+		return err
 	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return fmt.Errorf("invalid port number: %v", err)
-	}
-	if host == "" {
-		host = "localhost"
-	}
-
 	interactiveMode = true
 	ui := makeWebInterface(p, o)
 	for n, c := range pprofCommands {
@@ -111,22 +104,56 @@ func serveWebInterface(hostport string, p *profile.Profile, o *plugin.Options) e
 		server = defaultWebServer
 	}
 	args := &plugin.HTTPServerArgs{
-		Hostport: net.JoinHostPort(host, portStr),
+		Hostport: net.JoinHostPort(host, strconv.Itoa(port)),
 		Host:     host,
 		Port:     port,
 		Handlers: map[string]http.Handler{
-			"/":       http.HandlerFunc(ui.dot),
-			"/top":    http.HandlerFunc(ui.top),
-			"/disasm": http.HandlerFunc(ui.disasm),
-			"/source": http.HandlerFunc(ui.source),
-			"/peek":   http.HandlerFunc(ui.peek),
+			"/":           http.HandlerFunc(ui.dot),
+			"/top":        http.HandlerFunc(ui.top),
+			"/disasm":     http.HandlerFunc(ui.disasm),
+			"/source":     http.HandlerFunc(ui.source),
+			"/peek":       http.HandlerFunc(ui.peek),
+			"/flamegraph": http.HandlerFunc(ui.flamegraph),
 		},
 	}
 
-	go openBrowser("http://"+args.Hostport, o)
+	url := "http://" + args.Hostport
+
+	o.UI.Print("Serving web UI on ", url)
+
+	if o.UI.WantBrowser() && !disableBrowser {
+		go openBrowser(url, o)
+	}
 	return server(args)
 }
 
+func getHostAndPort(hostport string) (string, int, error) {
+	host, portStr, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return "", 0, fmt.Errorf("could not split http address: %v", err)
+	}
+	if host == "" {
+		host = "localhost"
+	}
+	var port int
+	if portStr == "" {
+		ln, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
+		if err != nil {
+			return "", 0, fmt.Errorf("could not generate random port: %v", err)
+		}
+		port = ln.Addr().(*net.TCPAddr).Port
+		err = ln.Close()
+		if err != nil {
+			return "", 0, fmt.Errorf("could not generate random port: %v", err)
+		}
+	} else {
+		port, err = strconv.Atoi(portStr)
+		if err != nil {
+			return "", 0, fmt.Errorf("invalid port number: %v", err)
+		}
+	}
+	return host, port, nil
+}
 func defaultWebServer(args *plugin.HTTPServerArgs) error {
 	ln, err := net.Listen("tcp", args.Hostport)
 	if err != nil {
@@ -149,8 +176,23 @@ func defaultWebServer(args *plugin.HTTPServerArgs) error {
 		}
 		h.ServeHTTP(w, req)
 	})
-	s := &http.Server{Handler: handler}
+
+	// We serve the ui at /ui/ and redirect there from the root. This is done
+	// to surface any problems with serving the ui at a non-root early. See:
+	//
+	// https://github.com/google/pprof/pull/348
+	mux := http.NewServeMux()
+	mux.Handle("/ui/", http.StripPrefix("/ui", handler))
+	mux.Handle("/", redirectWithQuery("/ui"))
+	s := &http.Server{Handler: mux}
 	return s.Serve(ln)
+}
+
+func redirectWithQuery(path string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		pathWithQuery := &gourl.URL{Path: path, RawQuery: r.URL.RawQuery}
+		http.Redirect(w, r, pathWithQuery.String(), http.StatusTemporaryRedirect)
+	}
 }
 
 func isLocalhost(host string) bool {
@@ -169,8 +211,10 @@ func openBrowser(url string, o *plugin.Options) {
 	for _, p := range []struct{ param, key string }{
 		{"f", "focus"},
 		{"s", "show"},
+		{"sf", "show_from"},
 		{"i", "ignore"},
 		{"h", "hide"},
+		{"si", "sample_index"},
 	} {
 		if v := pprofVariables[p.key].value; v != "" {
 			q.Set(p.param, v)
@@ -200,8 +244,10 @@ func varsFromURL(u *gourl.URL) variables {
 	vars := pprofVariables.makeCopy()
 	vars["focus"].value = u.Query().Get("f")
 	vars["show"].value = u.Query().Get("s")
+	vars["show_from"].value = u.Query().Get("sf")
 	vars["ignore"].value = u.Query().Get("i")
 	vars["hide"].value = u.Query().Get("h")
+	vars["sample_index"].value = u.Query().Get("si")
 	return vars
 }
 
@@ -225,14 +271,14 @@ func (ui *webInterface) makeReport(w http.ResponseWriter, req *http.Request,
 }
 
 // render generates html using the named template based on the contents of data.
-func (ui *webInterface) render(w http.ResponseWriter, baseURL, tmpl string,
+func (ui *webInterface) render(w http.ResponseWriter, tmpl string,
 	rpt *report.Report, errList, legend []string, data webArgs) {
 	file := getFromLegend(legend, "File: ", "unknown")
 	profile := getFromLegend(legend, "Type: ", "unknown")
-	data.BaseURL = baseURL
 	data.Title = file + " " + profile
 	data.Errors = errList
 	data.Total = rpt.Total()
+	data.SampleTypes = sampleTypes(ui.prof)
 	data.Legend = legend
 	data.Help = ui.help
 	html := &bytes.Buffer{}
@@ -274,7 +320,7 @@ func (ui *webInterface) dot(w http.ResponseWriter, req *http.Request) {
 		nodes = append(nodes, n.Info.Name)
 	}
 
-	ui.render(w, "/", "graph", rpt, errList, legend, webArgs{
+	ui.render(w, "graph", rpt, errList, legend, webArgs{
 		HTMLBody: template.HTML(string(svg)),
 		Nodes:    nodes,
 	})
@@ -309,7 +355,7 @@ func (ui *webInterface) top(w http.ResponseWriter, req *http.Request) {
 		nodes = append(nodes, item.Name)
 	}
 
-	ui.render(w, "/top", "top", rpt, errList, legend, webArgs{
+	ui.render(w, "top", rpt, errList, legend, webArgs{
 		Top:   top,
 		Nodes: nodes,
 	})
@@ -331,7 +377,7 @@ func (ui *webInterface) disasm(w http.ResponseWriter, req *http.Request) {
 	}
 
 	legend := report.ProfileLabels(rpt)
-	ui.render(w, "/disasm", "plaintext", rpt, errList, legend, webArgs{
+	ui.render(w, "plaintext", rpt, errList, legend, webArgs{
 		TextBody: out.String(),
 	})
 
@@ -355,7 +401,7 @@ func (ui *webInterface) source(w http.ResponseWriter, req *http.Request) {
 	}
 
 	legend := report.ProfileLabels(rpt)
-	ui.render(w, "/source", "sourcelisting", rpt, errList, legend, webArgs{
+	ui.render(w, "sourcelisting", rpt, errList, legend, webArgs{
 		HTMLBody: template.HTML(body.String()),
 	})
 }
@@ -376,7 +422,7 @@ func (ui *webInterface) peek(w http.ResponseWriter, req *http.Request) {
 	}
 
 	legend := report.ProfileLabels(rpt)
-	ui.render(w, "/peek", "plaintext", rpt, errList, legend, webArgs{
+	ui.render(w, "plaintext", rpt, errList, legend, webArgs{
 		TextBody: out.String(),
 	})
 }

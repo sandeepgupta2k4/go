@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build darwin dragonfly freebsd linux netbsd openbsd solaris
+// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris
 
 package runtime
 
@@ -103,6 +103,8 @@ func initsig(preinit bool) {
 			// set SA_ONSTACK if necessary.
 			if fwdSig[i] != _SIG_DFL && fwdSig[i] != _SIG_IGN {
 				setsigstack(i)
+			} else if fwdSig[i] == _SIG_IGN {
+				sigInitIgnored(i)
 			}
 			continue
 		}
@@ -266,7 +268,7 @@ func setThreadCPUProfiler(hz int32) {
 }
 
 func sigpipe() {
-	if sigsend(_SIGPIPE) {
+	if signal_ignored(_SIGPIPE) || sigsend(_SIGPIPE) {
 		return
 	}
 	dieFromSignal(_SIGPIPE)
@@ -294,6 +296,7 @@ func sigtrampgo(sig uint32, info *siginfo, ctx unsafe.Pointer) {
 			sigprofNonGoPC(c.sigpc())
 			return
 		}
+		c.fixsigcode(sig)
 		badsignal(uintptr(sig), c)
 		return
 	}
@@ -314,7 +317,7 @@ func sigtrampgo(sig uint32, info *siginfo, ctx unsafe.Pointer) {
 			st := stackt{ss_size: g.m.g0.stack.hi - g.m.g0.stack.lo}
 			setSignalstackSP(&st, g.m.g0.stack.lo)
 			setGsignalStack(&st, &gsignalStack)
-			g.m.gsignal.stktopsp = getcallersp(unsafe.Pointer(&sig))
+			g.m.gsignal.stktopsp = getcallersp()
 			setStack = true
 		} else {
 			var st stackt
@@ -333,7 +336,7 @@ func sigtrampgo(sig uint32, info *siginfo, ctx unsafe.Pointer) {
 				dropm()
 			}
 			setGsignalStack(&st, &gsignalStack)
-			g.m.gsignal.stktopsp = getcallersp(unsafe.Pointer(&sig))
+			g.m.gsignal.stktopsp = getcallersp()
 			setStack = true
 		}
 	}
@@ -360,6 +363,15 @@ func sigtrampgo(sig uint32, info *siginfo, ctx unsafe.Pointer) {
 // the signal handler. The effect is that the program will act as
 // though the function that got the signal simply called sigpanic
 // instead.
+//
+// This must NOT be nosplit because the linker doesn't know where
+// sigpanic calls can be injected.
+//
+// The signal handler must not inject a call to sigpanic if
+// getg().throwsplit, since sigpanic may need to grow the stack.
+//
+// This is exported via linkname to assembly in runtime/cgo.
+//go:linkname sigpanic
 func sigpanic() {
 	g := getg()
 	if !canpanic(g) {
@@ -432,14 +444,6 @@ func dieFromSignal(sig uint32) {
 	osyield()
 	osyield()
 
-	// On Darwin we may still fail to die, because raise sends the
-	// signal to the whole process rather than just the current thread,
-	// and osyield just sleeps briefly rather than letting all other
-	// threads run. See issue 20315. Sleep longer.
-	if GOOS == "darwin" {
-		usleep(100)
-	}
-
 	// If we are still somehow running, just exit with the wrong status.
 	exit(2)
 }
@@ -478,7 +482,10 @@ func raisebadsignal(sig uint32, c *sigctxt) {
 	// re-installing sighandler. At this point we can just
 	// return and the signal will be re-raised and caught by
 	// the default handler with the correct context.
-	if (isarchive || islibrary) && handler == _SIG_DFL && c.sigcode() != _SI_USER {
+	//
+	// On FreeBSD, the libthr sigaction code prevents
+	// this from working so we fall through to raise.
+	if GOOS != "freebsd" && (isarchive || islibrary) && handler == _SIG_DFL && c.sigcode() != _SI_USER {
 		return
 	}
 
@@ -498,17 +505,16 @@ func raisebadsignal(sig uint32, c *sigctxt) {
 	setsig(sig, funcPC(sighandler))
 }
 
+//go:nosplit
 func crash() {
-	if GOOS == "darwin" {
-		// OS X core dumps are linear dumps of the mapped memory,
-		// from the first virtual byte to the last, with zeros in the gaps.
-		// Because of the way we arrange the address space on 64-bit systems,
-		// this means the OS X core file will be >128 GB and even on a zippy
-		// workstation can take OS X well over an hour to write (uninterruptible).
-		// Save users from making that mistake.
-		if GOARCH == "amd64" {
-			return
-		}
+	// OS X core dumps are linear dumps of the mapped memory,
+	// from the first virtual byte to the last, with zeros in the gaps.
+	// Because of the way we arrange the address space on 64-bit systems,
+	// this means the OS X core file will be >128 GB and even on a zippy
+	// workstation can take OS X well over an hour to write (uninterruptible).
+	// Save users from making that mistake.
+	if GOOS == "darwin" && GOARCH == "amd64" {
+		return
 	}
 
 	dieFromSignal(_SIGABRT)
@@ -769,7 +775,7 @@ func unminitSignals() {
 	}
 }
 
-// blockableSig returns whether sig may be blocked by the signal mask.
+// blockableSig reports whether sig may be blocked by the signal mask.
 // We never want to block the signals marked _SigUnblock;
 // these are the synchronous signals that turn into a Go panic.
 // In a Go program--not a c-archive/c-shared--we never want to block
@@ -840,7 +846,11 @@ func signalstack(s *stack) {
 }
 
 // setsigsegv is used on darwin/arm{,64} to fake a segmentation fault.
+//
+// This is exported via linkname to assembly in runtime/cgo.
+//
 //go:nosplit
+//go:linkname setsigsegv
 func setsigsegv(pc uintptr) {
 	g := getg()
 	g.sig = _SIGSEGV

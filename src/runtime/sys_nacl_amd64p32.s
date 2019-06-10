@@ -89,6 +89,22 @@ playback:
 	CMPL BX, $0
 	JNE playback
 
+	MOVQ runtime·lastfaketime(SB), CX
+	MOVL runtime·lastfaketimefd(SB), BX
+	CMPL DI, BX
+	JE samefd
+
+	// If the current fd doesn't match the fd of the previous write,
+	// ensure that the timestamp is strictly greater. That way, we can
+	// recover the original order even if we read the fds separately.
+	INCQ CX
+	MOVL DI, runtime·lastfaketimefd(SB)
+
+samefd:
+	CMPQ AX, CX
+	CMOVQLT CX, AX
+	MOVQ AX, runtime·lastfaketime(SB)
+
 	// Playback header: 0 0 P B <8-byte time> <4-byte data length>
 	MOVL $(('B'<<24) | ('P'<<16)), 0(SP)
 	BSWAPQ AX
@@ -277,13 +293,6 @@ realtime:
 TEXT syscall·now(SB),NOSPLIT,$0
 	JMP runtime·walltime(SB)
 
-TEXT runtime·nacl_clock_gettime(SB),NOSPLIT,$0
-	MOVL arg1+0(FP), DI
-	MOVL arg2+4(FP), SI
-	NACL_SYSCALL(SYS_clock_gettime)
-	MOVL AX, ret+8(FP)
-	RET
-
 TEXT runtime·nanotime(SB),NOSPLIT,$16
 	MOVQ runtime·faketime(SB), AX
 	CMPQ AX, $0
@@ -312,19 +321,19 @@ TEXT runtime·sigtramp(SB),NOSPLIT,$80
 	// NOTE: Cannot use SYS_tls_get here (like we do in mstart_nacl),
 	// because the main thread never calls tls_set.
 	LEAL ctxt+0(FP), AX
-	MOVL (16*4+5*8)(AX), AX
+	MOVL	(16*4+5*8)(AX), AX
 	MOVL	AX, TLS
 
 	// check that g exists
 	get_tls(CX)
 	MOVL	g(CX), DI
-	
+
 	CMPL	DI, $0
 	JEQ	nog
 
 	// save g
 	MOVL	DI, 20(SP)
-	
+
 	// g = m->gsignal
 	MOVL	g_m(DI), BX
 	MOVL	m_gsignal(BX), BX

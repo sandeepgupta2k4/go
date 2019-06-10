@@ -46,42 +46,27 @@ func (c *sigctxt) fault() uintptr { return uintptr(c.sigaddr()) }
 
 // preparePanic sets up the stack to look like a call to sigpanic.
 func (c *sigctxt) preparePanic(sig uint32, gp *g) {
-	if GOOS == "darwin" {
-		// Work around Leopard bug that doesn't set FPE_INTDIV.
-		// Look at instruction to see if it is a divide.
-		// Not necessary in Snow Leopard (si_code will be != 0).
-		if sig == _SIGFPE && gp.sigcode0 == 0 {
-			pc := (*[4]byte)(unsafe.Pointer(gp.sigpc))
-			i := 0
-			if pc[i]&0xF0 == 0x40 { // 64-bit REX prefix
-				i++
-			} else if pc[i] == 0x66 { // 16-bit instruction prefix
-				i++
-			}
-			if pc[i] == 0xF6 || pc[i] == 0xF7 {
-				gp.sigcode0 = _FPE_INTDIV
-			}
+	// Work around Leopard bug that doesn't set FPE_INTDIV.
+	// Look at instruction to see if it is a divide.
+	// Not necessary in Snow Leopard (si_code will be != 0).
+	if GOOS == "darwin" && sig == _SIGFPE && gp.sigcode0 == 0 {
+		pc := (*[4]byte)(unsafe.Pointer(gp.sigpc))
+		i := 0
+		if pc[i]&0xF0 == 0x40 { // 64-bit REX prefix
+			i++
+		} else if pc[i] == 0x66 { // 16-bit instruction prefix
+			i++
+		}
+		if pc[i] == 0xF6 || pc[i] == 0xF7 {
+			gp.sigcode0 = _FPE_INTDIV
 		}
 	}
 
 	pc := uintptr(c.rip())
 	sp := uintptr(c.rsp())
 
-	// If we don't recognize the PC as code
-	// but we do recognize the top pointer on the stack as code,
-	// then assume this was a call to non-code and treat like
-	// pc == 0, to make unwinding show the context.
-	if pc != 0 && !findfunc(pc).valid() && findfunc(*(*uintptr)(unsafe.Pointer(sp))).valid() {
-		pc = 0
-	}
-
-	// Only push runtime.sigpanic if pc != 0.
-	// If pc == 0, probably panicked because of a
-	// call to a nil func. Not pushing that onto sp will
-	// make the trace look like a call to runtime.sigpanic instead.
-	// (Otherwise the trace will end at runtime.sigpanic and we
-	// won't get to see who faulted.)
-	if pc != 0 {
+	if shouldPushSigpanic(gp, pc, *(*uintptr)(unsafe.Pointer(sp))) {
+		// Make it look the like faulting PC called sigpanic.
 		if sys.RegSize > sys.PtrSize {
 			sp -= sys.PtrSize
 			*(*uintptr)(unsafe.Pointer(sp)) = 0

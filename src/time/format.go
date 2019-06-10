@@ -48,6 +48,10 @@ import "errors"
 // The recognized day of week formats are "Mon" and "Monday".
 // The recognized month formats are "Jan" and "January".
 //
+// The formats 2, _2, and 02 are unpadded, space-padded, and zero-padded
+// day of month. The formats __2 and 002 are space-padded and zero-padded
+// three-character day of year; there is no unpadded day of year format.
+//
 // Text in the format string that is not recognized as part of the reference
 // time is echoed verbatim during Format and expected to appear verbatim
 // in the input to Parse.
@@ -90,22 +94,20 @@ const (
 	stdLongMonth             = iota + stdNeedDate  // "January"
 	stdMonth                                       // "Jan"
 	stdNumMonth                                    // "1"
-	stdUnderMonth                                  // "_1"
 	stdZeroMonth                                   // "01"
 	stdLongWeekDay                                 // "Monday"
 	stdWeekDay                                     // "Mon"
 	stdDay                                         // "2"
 	stdUnderDay                                    // "_2"
 	stdZeroDay                                     // "02"
+	stdUnderYearDay                                // "__2"
+	stdZeroYearDay                                 // "002"
 	stdHour                  = iota + stdNeedClock // "15"
 	stdHour12                                      // "3"
-	stdUnderHour12                                 // "_3"
 	stdZeroHour12                                  // "03"
 	stdMinute                                      // "4"
-	stdUnderMinute                                 // "_4"
 	stdZeroMinute                                  // "04"
 	stdSecond                                      // "5"
-	stdUnderSecond                                 // "_5"
 	stdZeroSecond                                  // "05"
 	stdLongYear              = iota + stdNeedDate  // "2006"
 	stdYear                                        // "06"
@@ -174,9 +176,12 @@ func nextStdChunk(layout string) (prefix string, std int, suffix string) {
 				}
 			}
 
-		case '0': // 01, 02, 03, 04, 05, 06
+		case '0': // 01, 02, 03, 04, 05, 06, 002
 			if len(layout) >= i+2 && '1' <= layout[i+1] && layout[i+1] <= '6' {
 				return layout[0:i], std0x[layout[i+1]-'1'], layout[i+2:]
+			}
+			if len(layout) >= i+3 && layout[i+1] == '0' && layout[i+2] == '2' {
+				return layout[0:i], stdZeroYearDay, layout[i+3:]
 			}
 
 		case '1': // 15, 1
@@ -191,24 +196,16 @@ func nextStdChunk(layout string) (prefix string, std int, suffix string) {
 			}
 			return layout[0:i], stdDay, layout[i+1:]
 
-		case '_': // _1, _2, _2006, _3, _4, _5
-			if len(layout) >= i+2 {
-				switch layout[i+1] {
-				case '1':
-					return layout[0:i], stdUnderMonth, layout[i+2:]
-				case '2':
-					//_2006 is really a literal _, followed by stdLongYear
-					if len(layout) >= i+5 && layout[i+1:i+5] == "2006" {
-						return layout[0 : i+1], stdLongYear, layout[i+5:]
-					}
-					return layout[0:i], stdUnderDay, layout[i+2:]
-				case '3':
-					return layout[0:i], stdUnderHour12, layout[i+2:]
-				case '4':
-					return layout[0:i], stdUnderMinute, layout[i+2:]
-				case '5':
-					return layout[0:i], stdUnderSecond, layout[i+2:]
+		case '_': // _2, _2006, __2
+			if len(layout) >= i+2 && layout[i+1] == '2' {
+				//_2006 is really a literal _, followed by stdLongYear
+				if len(layout) >= i+5 && layout[i+1:i+5] == "2006" {
+					return layout[0 : i+1], stdLongYear, layout[i+5:]
 				}
+				return layout[0:i], stdUnderDay, layout[i+2:]
+			}
+			if len(layout) >= i+3 && layout[i+1] == '_' && layout[i+2] == '2' {
+				return layout[0:i], stdUnderYearDay, layout[i+3:]
 			}
 
 		case '3':
@@ -518,6 +515,7 @@ func (t Time) AppendFormat(b []byte, layout string) []byte {
 		year  int = -1
 		month Month
 		day   int
+		yday  int
 		hour  int = -1
 		min   int
 		sec   int
@@ -535,7 +533,8 @@ func (t Time) AppendFormat(b []byte, layout string) []byte {
 
 		// Compute year, month, day if needed.
 		if year < 0 && std&stdNeedDate != 0 {
-			year, month, day, _ = absDate(abs, true)
+			year, month, day, yday = absDate(abs, true)
+			yday++
 		}
 
 		// Compute hour, minute, second if needed.
@@ -559,11 +558,6 @@ func (t Time) AppendFormat(b []byte, layout string) []byte {
 			b = append(b, m...)
 		case stdNumMonth:
 			b = appendInt(b, int(month), 0)
-		case stdUnderMonth:
-			if month < 10 {
-				b = append(b, ' ')
-			}
-			b = appendInt(b, int(month), 0)
 		case stdZeroMonth:
 			b = appendInt(b, int(month), 2)
 		case stdWeekDay:
@@ -580,6 +574,16 @@ func (t Time) AppendFormat(b []byte, layout string) []byte {
 			b = appendInt(b, day, 0)
 		case stdZeroDay:
 			b = appendInt(b, day, 2)
+		case stdUnderYearDay:
+			if yday < 100 {
+				b = append(b, ' ')
+				if yday < 10 {
+					b = append(b, ' ')
+				}
+			}
+			b = appendInt(b, yday, 0)
+		case stdZeroYearDay:
+			b = appendInt(b, yday, 3)
 		case stdHour:
 			b = appendInt(b, hour, 2)
 		case stdHour12:
@@ -587,16 +591,6 @@ func (t Time) AppendFormat(b []byte, layout string) []byte {
 			hr := hour % 12
 			if hr == 0 {
 				hr = 12
-			}
-			b = appendInt(b, hr, 0)
-		case stdUnderHour12:
-			// Noon is 12PM, midnight is 12AM.
-			hr := hour % 12
-			if hr == 0 {
-				hr = 12
-			}
-			if hr < 10 {
-				b = append(b, ' ')
 			}
 			b = appendInt(b, hr, 0)
 		case stdZeroHour12:
@@ -608,19 +602,9 @@ func (t Time) AppendFormat(b []byte, layout string) []byte {
 			b = appendInt(b, hr, 2)
 		case stdMinute:
 			b = appendInt(b, min, 0)
-		case stdUnderMinute:
-			if min < 10 {
-				b = append(b, ' ')
-			}
-			b = appendInt(b, min, 0)
 		case stdZeroMinute:
 			b = appendInt(b, min, 2)
 		case stdSecond:
-			b = appendInt(b, sec, 0)
-		case stdUnderSecond:
-			if sec < 10 {
-				b = append(b, ' ')
-			}
 			b = appendInt(b, sec, 0)
 		case stdZeroSecond:
 			b = appendInt(b, sec, 2)
@@ -728,7 +712,7 @@ func isDigit(s string, i int) bool {
 	return '0' <= c && c <= '9'
 }
 
-// getnum parses s[0:1] or s[0:2] (fixed forces the latter)
+// getnum parses s[0:1] or s[0:2] (fixed forces s[0:2])
 // as a decimal integer and returns the integer and the
 // remainder of the string.
 func getnum(s string, fixed bool) (int, string, error) {
@@ -742,6 +726,20 @@ func getnum(s string, fixed bool) (int, string, error) {
 		return int(s[0] - '0'), s[1:], nil
 	}
 	return int(s[0]-'0')*10 + int(s[1]-'0'), s[2:], nil
+}
+
+// getnum3 parses s[0:1], s[0:2], or s[0:3] (fixed forces s[0:3])
+// as a decimal integer and returns the integer and the remainder
+// of the string.
+func getnum3(s string, fixed bool) (int, string, error) {
+	var n, i int
+	for i = 0; i < 3 && isDigit(s, i); i++ {
+		n = n*10 + int(s[i]-'0')
+	}
+	if i == 0 || fixed && i != 3 {
+		return 0, s, errBad
+	}
+	return n, s[i:], nil
 }
 
 func cutspace(s string) string {
@@ -832,8 +830,9 @@ func parse(layout, value string, defaultLocation, local *Location) (Time, error)
 	// Time being constructed.
 	var (
 		year       int
-		month      int = 1 // January
-		day        int = 1
+		month      int = -1
+		day        int = -1
+		yday       int = -1
 		hour       int
 		min        int
 		sec        int
@@ -866,9 +865,12 @@ func parse(layout, value string, defaultLocation, local *Location) (Time, error)
 				err = errBad
 				break
 			}
+			hold := value
 			p, value = value[0:2], value[2:]
 			year, err = atoi(p)
-			if year >= 69 { // Unix time starts Dec 31 1969 in some time zones
+			if err != nil {
+				value = hold
+			} else if year >= 69 { // Unix time starts Dec 31 1969 in some time zones
 				year += 1900
 			} else {
 				year += 2000
@@ -886,12 +888,9 @@ func parse(layout, value string, defaultLocation, local *Location) (Time, error)
 		case stdLongMonth:
 			month, value, err = lookup(longMonthNames, value)
 			month++
-		case stdNumMonth, stdUnderMonth, stdZeroMonth:
-			if std == stdUnderMonth && len(value) > 0 && value[0] == ' ' {
-				value = value[1:]
-			}
+		case stdNumMonth, stdZeroMonth:
 			month, value, err = getnum(value, std == stdZeroMonth)
-			if month <= 0 || 12 < month {
+			if err == nil && (month <= 0 || 12 < month) {
 				rangeErrString = "month"
 			}
 		case stdWeekDay:
@@ -904,35 +903,33 @@ func parse(layout, value string, defaultLocation, local *Location) (Time, error)
 				value = value[1:]
 			}
 			day, value, err = getnum(value, std == stdZeroDay)
-			if day < 0 {
-				// Note that we allow any one- or two-digit day here.
-				rangeErrString = "day"
+			// Note that we allow any one- or two-digit day here.
+			// The month, day, year combination is validated after we've completed parsing.
+		case stdUnderYearDay, stdZeroYearDay:
+			for i := 0; i < 2; i++ {
+				if std == stdUnderYearDay && len(value) > 0 && value[0] == ' ' {
+					value = value[1:]
+				}
 			}
+			yday, value, err = getnum3(value, std == stdZeroYearDay)
+			// Note that we allow any one-, two-, or three-digit year-day here.
+			// The year-day, year combination is validated after we've completed parsing.
 		case stdHour:
 			hour, value, err = getnum(value, false)
 			if hour < 0 || 24 <= hour {
 				rangeErrString = "hour"
 			}
-		case stdHour12, stdUnderHour12, stdZeroHour12:
-			if std == stdUnderHour12 && len(value) > 0 && value[0] == ' ' {
-				value = value[1:]
-			}
+		case stdHour12, stdZeroHour12:
 			hour, value, err = getnum(value, std == stdZeroHour12)
 			if hour < 0 || 12 < hour {
 				rangeErrString = "hour"
 			}
-		case stdMinute, stdUnderMinute, stdZeroMinute:
-			if std == stdUnderMinute && len(value) > 0 && value[0] == ' ' {
-				value = value[1:]
-			}
+		case stdMinute, stdZeroMinute:
 			min, value, err = getnum(value, std == stdZeroMinute)
 			if min < 0 || 60 <= min {
 				rangeErrString = "minute"
 			}
-		case stdSecond, stdUnderSecond, stdZeroSecond:
-			if std == stdUnderSecond && len(value) > 0 && value[0] == ' ' {
-				value = value[1:]
-			}
+		case stdSecond, stdZeroSecond:
 			sec, value, err = getnum(value, std == stdZeroSecond)
 			if sec < 0 || 60 <= sec {
 				rangeErrString = "second"
@@ -1096,6 +1093,47 @@ func parse(layout, value string, defaultLocation, local *Location) (Time, error)
 		hour = 0
 	}
 
+	// Convert yday to day, month.
+	if yday >= 0 {
+		var d int
+		var m int
+		if isLeap(year) {
+			if yday == 31+29 {
+				m = int(February)
+				d = 29
+			} else if yday > 31+29 {
+				yday--
+			}
+		}
+		if yday < 1 || yday > 365 {
+			return Time{}, &ParseError{alayout, avalue, "", value, ": day-of-year out of range"}
+		}
+		if m == 0 {
+			m = yday/31 + 1
+			if int(daysBefore[m]) < yday {
+				m++
+			}
+			d = yday - int(daysBefore[m-1])
+		}
+		// If month, day already seen, yday's m, d must match.
+		// Otherwise, set them from m, d.
+		if month >= 0 && month != m {
+			return Time{}, &ParseError{alayout, avalue, "", value, ": day-of-year does not match month"}
+		}
+		month = m
+		if day >= 0 && day != d {
+			return Time{}, &ParseError{alayout, avalue, "", value, ": day-of-year does not match day"}
+		}
+		day = d
+	} else {
+		if month < 0 {
+			month = int(January)
+		}
+		if day < 0 {
+			day = 1
+		}
+	}
+
 	// Validate the day of the month.
 	if day < 1 || day > daysIn(Month(month), year) {
 		return Time{}, &ParseError{alayout, avalue, "", value, ": day out of range"}
@@ -1111,7 +1149,7 @@ func parse(layout, value string, defaultLocation, local *Location) (Time, error)
 
 		// Look for local zone with the given offset.
 		// If that zone was in effect at the given time, use it.
-		name, offset, _, _, _ := local.lookup(t.unixSec())
+		name, offset, _, _ := local.lookup(t.unixSec())
 		if offset == zoneOffset && (zoneName == "" || name == zoneName) {
 			t.setLoc(local)
 			return t, nil
@@ -1169,6 +1207,12 @@ func parseTimeZone(value string) (length int, ok bool) {
 		length = parseGMT(value)
 		return length, true
 	}
+	// Special Case 3: Some time zones are not named, but have +/-00 format
+	if value[0] == '+' || value[0] == '-' {
+		length = parseSignedOffset(value)
+		ok := length > 0 // parseSignedOffset returns 0 in case of bad input
+		return length, ok
+	}
 	// How many upper-case letters are there? Need at least three, at most five.
 	var nUpper int
 	for nUpper = 0; nUpper < 6; nUpper++ {
@@ -1199,27 +1243,37 @@ func parseTimeZone(value string) (length int, ok bool) {
 
 // parseGMT parses a GMT time zone. The input string is known to start "GMT".
 // The function checks whether that is followed by a sign and a number in the
-// range -14 through 12 excluding zero.
+// range -23 through +23 excluding zero.
 func parseGMT(value string) int {
 	value = value[3:]
 	if len(value) == 0 {
 		return 3
 	}
+
+	return 3 + parseSignedOffset(value)
+}
+
+// parseSignedOffset parses a signed timezone offset (e.g. "+03" or "-04").
+// The function checks for a signed number in the range -23 through +23 excluding zero.
+// Returns length of the found offset string or 0 otherwise
+func parseSignedOffset(value string) int {
 	sign := value[0]
 	if sign != '-' && sign != '+' {
-		return 3
+		return 0
 	}
 	x, rem, err := leadingInt(value[1:])
-	if err != nil {
-		return 3
+
+	// fail if nothing consumed by leadingInt
+	if err != nil || value[1:] == rem {
+		return 0
 	}
 	if sign == '-' {
 		x = -x
 	}
-	if x == 0 || x < -14 || 12 < x {
-		return 3
+	if x < -23 || 23 < x {
+		return 0
 	}
-	return 3 + len(value) - len(rem)
+	return len(value) - len(rem)
 }
 
 func parseNanoseconds(value string, nbytes int) (ns int, rangeErrString string, err error) {

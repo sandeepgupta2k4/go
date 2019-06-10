@@ -27,7 +27,7 @@ func Flushplist(ctxt *Link, plist *Plist, newprog ProgAlloc, myimportpath string
 
 	var plink *Prog
 	for p := plist.Firstpc; p != nil; p = plink {
-		if ctxt.Debugasm && ctxt.Debugvlog {
+		if ctxt.Debugasm > 0 && ctxt.Debugvlog {
 			fmt.Printf("obj: %v\n", p)
 		}
 		plink = p.Link
@@ -105,6 +105,9 @@ func Flushplist(ctxt *Link, plist *Plist, newprog ProgAlloc, myimportpath string
 		linkpatch(ctxt, s, newprog)
 		ctxt.Arch.Preprocess(ctxt, s, newprog)
 		ctxt.Arch.Assemble(ctxt, s, newprog)
+		if ctxt.Errors > 0 {
+			continue
+		}
 		linkpcln(ctxt, s)
 		ctxt.populateDWARF(plist.Curfn, s, myimportpath)
 	}
@@ -119,9 +122,6 @@ func (ctxt *Link) InitTextSym(s *LSym, flag int) {
 		ctxt.Diag("InitTextSym double init for %s", s.Name)
 	}
 	s.Func = new(FuncInfo)
-	if s.Func.Text != nil {
-		ctxt.Diag("duplicate TEXT for %s", s.Name)
-	}
 	if s.OnList() {
 		ctxt.Diag("symbol %s listed multiple times", s.Name)
 	}
@@ -132,11 +132,12 @@ func (ctxt *Link) InitTextSym(s *LSym, flag int) {
 	s.Set(AttrWrapper, flag&WRAPPER != 0)
 	s.Set(AttrNeedCtxt, flag&NEEDCTXT != 0)
 	s.Set(AttrNoFrame, flag&NOFRAME != 0)
+	s.Set(AttrTopFrame, flag&TOPFRAME != 0)
 	s.Type = objabi.STEXT
 	ctxt.Text = append(ctxt.Text, s)
 
 	// Set up DWARF entries for s.
-	info, loc, ranges, _ := ctxt.dwarfSym(s)
+	info, loc, ranges, _, isstmt := ctxt.dwarfSym(s)
 	info.Type = objabi.SDWARFINFO
 	info.Set(AttrDuplicateOK, s.DuplicateOK())
 	if loc != nil {
@@ -147,15 +148,9 @@ func (ctxt *Link) InitTextSym(s *LSym, flag int) {
 	ranges.Type = objabi.SDWARFRANGE
 	ranges.Set(AttrDuplicateOK, s.DuplicateOK())
 	ctxt.Data = append(ctxt.Data, info, ranges)
-
-	// Set up the function's gcargs and gclocals.
-	// They will be filled in later if needed.
-	gcargs := &s.Func.GCArgs
-	gcargs.Set(AttrDuplicateOK, true)
-	gcargs.Type = objabi.SRODATA
-	gclocals := &s.Func.GCLocals
-	gclocals.Set(AttrDuplicateOK, true)
-	gclocals.Type = objabi.SRODATA
+	isstmt.Type = objabi.SDWARFMISC
+	isstmt.Set(AttrDuplicateOK, s.DuplicateOK())
+	ctxt.Data = append(ctxt.Data, isstmt)
 }
 
 func (ctxt *Link) Globl(s *LSym, size int64, flag int) {
@@ -186,4 +181,28 @@ func (ctxt *Link) Globl(s *LSym, size int64, flag int) {
 	} else if flag&TLSBSS != 0 {
 		s.Type = objabi.STLSBSS
 	}
+}
+
+// EmitEntryLiveness generates PCDATA Progs after p to switch to the
+// liveness map active at the entry of function s. It returns the last
+// Prog generated.
+func (ctxt *Link) EmitEntryLiveness(s *LSym, p *Prog, newprog ProgAlloc) *Prog {
+	pcdata := Appendp(p, newprog)
+	pcdata.Pos = s.Func.Text.Pos
+	pcdata.As = APCDATA
+	pcdata.From.Type = TYPE_CONST
+	pcdata.From.Offset = objabi.PCDATA_StackMapIndex
+	pcdata.To.Type = TYPE_CONST
+	pcdata.To.Offset = -1 // pcdata starts at -1 at function entry
+
+	// Same, with register map.
+	pcdata = Appendp(pcdata, newprog)
+	pcdata.Pos = s.Func.Text.Pos
+	pcdata.As = APCDATA
+	pcdata.From.Type = TYPE_CONST
+	pcdata.From.Offset = objabi.PCDATA_RegMapIndex
+	pcdata.To.Type = TYPE_CONST
+	pcdata.To.Offset = -1
+
+	return pcdata
 }

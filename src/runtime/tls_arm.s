@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// +build !windows
+
 #include "go_asm.h"
 #include "go_tls.h"
 #include "funcdata.h"
@@ -30,7 +32,7 @@
 // NOTE: runtime.gogo assumes that R1 is preserved by this function.
 //       runtime.mcall assumes this function only clobbers R0 and R11.
 // Returns with g in R0.
-TEXT runtime·save_g(SB),NOSPLIT,$-4
+TEXT runtime·save_g(SB),NOSPLIT|NOFRAME,$0
 #ifdef GOOS_nacl
 	// nothing to do as nacl/arm does not use TLS at all.
 	MOVW	g, R0 // preserve R0 across call to setg<>
@@ -86,7 +88,7 @@ TEXT runtime·_initcgo(SB),NOSPLIT,$4
 #ifdef TLSG_IS_VARIABLE
 	MOVW 	$runtime·tls_g(SB), R2 	// arg 2: &tls_g
 #else
-        MOVW	$0, R2			// arg 2: not used when using platform tls
+	MOVW	$0, R2			// arg 2: not used when using platform tls
 #endif
 	MOVW	$setg_gcc<>(SB), R1 	// arg 1: setg
 	MOVW	g, R0 			// arg 0: G
@@ -101,6 +103,11 @@ TEXT setg_gcc<>(SB),NOSPLIT,$0
 	B		runtime·save_g(SB)
 
 #ifdef TLSG_IS_VARIABLE
+#ifdef GOOS_android
+// Use the free TLS_SLOT_APP slot #2 on Android Q.
+// Earlier androids are set up in gcc_android.c.
+DATA runtime·tls_g+0(SB)/4, $8
+#endif
 GLOBL runtime·tls_g+0(SB), NOPTR, $4
 #else
 GLOBL runtime·tls_g+0(SB), TLSBSS, $4

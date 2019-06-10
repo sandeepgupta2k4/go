@@ -59,13 +59,47 @@ func flagalloc(f *Func) {
 		}
 	}
 
-	// Add flag recomputations where they are needed.
+	// Compute which flags values will need to be spilled.
+	spill := map[ID]bool{}
+	for _, b := range f.Blocks {
+		var flag *Value
+		if len(b.Preds) > 0 {
+			flag = end[b.Preds[0].b.ID]
+		}
+		for _, v := range b.Values {
+			for _, a := range v.Args {
+				if !a.Type.IsFlags() {
+					continue
+				}
+				if a == flag {
+					continue
+				}
+				// a will need to be restored here.
+				spill[a.ID] = true
+				flag = a
+			}
+			if v.clobbersFlags() {
+				flag = nil
+			}
+			if v.Type.IsFlags() {
+				flag = v
+			}
+		}
+		if v := b.Control; v != nil && v != flag && v.Type.IsFlags() {
+			spill[v.ID] = true
+		}
+		if v := end[b.ID]; v != nil && v != flag {
+			spill[v.ID] = true
+		}
+	}
+
+	// Add flag spill and recomputation where they are needed.
 	// TODO: Remove original instructions if they are never used.
 	var oldSched []*Value
 	for _, b := range f.Blocks {
 		oldSched = append(oldSched[:0], b.Values...)
 		b.Values = b.Values[:0]
-		// The current live flag value the pre-flagalloc copy).
+		// The current live flag value (the pre-flagalloc copy).
 		var flag *Value
 		if len(b.Preds) > 0 {
 			flag = end[b.Preds[0].b.ID]
@@ -81,6 +115,15 @@ func flagalloc(f *Func) {
 			if v.Op == OpPhi && v.Type.IsFlags() {
 				f.Fatalf("phi of flags not supported: %s", v.LongString())
 			}
+
+			// If v will be spilled, and v uses memory, then we must split it
+			// into a load + a flag generator.
+			if spill[v.ID] && v.MemoryArg() != nil {
+				if !f.Config.splitLoad(v) {
+					f.Fatalf("can't split flag generator: %s", v.LongString())
+				}
+			}
+
 			// Make sure any flag arg of v is in the flags register.
 			// If not, recompute it.
 			for i, a := range v.Args {
@@ -108,7 +151,7 @@ func flagalloc(f *Func) {
 		}
 		if v := b.Control; v != nil && v != flag && v.Type.IsFlags() {
 			// Recalculate control value.
-			c := v.copyInto(b)
+			c := copyFlags(v, b)
 			b.SetControl(c)
 			flag = v
 		}
