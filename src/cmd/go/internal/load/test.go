@@ -6,7 +6,6 @@ package load
 
 import (
 	"bytes"
-	"cmd/go/internal/base"
 	"cmd/go/internal/str"
 	"errors"
 	"fmt"
@@ -26,6 +25,7 @@ import (
 var TestMainDeps = []string{
 	// Dependencies for testmain.
 	"os",
+	"reflect",
 	"testing",
 	"testing/internal/testdeps",
 }
@@ -55,7 +55,6 @@ func TestPackagesFor(p *Package, cover *TestCover) (pmain, ptest, pxtest *Packag
 		}
 		if len(p1.DepsErrors) > 0 {
 			perr := p1.DepsErrors[0]
-			perr.Pos = "" // show full import stack
 			err = perr
 			break
 		}
@@ -102,7 +101,6 @@ func TestPackagesAndErrors(p *Package, cover *TestCover) (pmain, ptest, pxtest *
 	var stk ImportStack
 	stk.Push(p.ImportPath + " (test)")
 	rawTestImports := str.StringList(p.TestImports)
-	var ptestImportsTesting, pxtestImportsTesting bool
 	for i, path := range p.TestImports {
 		p1 := loadImport(pre, path, p.Dir, p, &stk, p.Internal.Build.TestImportPos[path], ResolveImport)
 		if str.Contains(p1.Deps, p.ImportPath) || p1.ImportPath == p.ImportPath {
@@ -111,15 +109,12 @@ func TestPackagesAndErrors(p *Package, cover *TestCover) (pmain, ptest, pxtest *
 			// non-test copy of a package.
 			ptestErr = &PackageError{
 				ImportStack:   testImportStack(stk[0], p1, p.ImportPath),
-				Err:           "import cycle not allowed in test",
+				Err:           errors.New("import cycle not allowed in test"),
 				IsImportCycle: true,
 			}
 		}
 		p.TestImports[i] = p1.ImportPath
 		imports = append(imports, p1)
-		if path == "testing" {
-			ptestImportsTesting = true
-		}
 	}
 	stk.Pop()
 	stk.Push(p.ImportPath + "_test")
@@ -133,9 +128,6 @@ func TestPackagesAndErrors(p *Package, cover *TestCover) (pmain, ptest, pxtest *
 			ximports = append(ximports, p1)
 		}
 		p.XTestImports[i] = p1.ImportPath
-		if path == "testing" {
-			pxtestImportsTesting = true
-		}
 	}
 	stk.Pop()
 
@@ -145,9 +137,6 @@ func TestPackagesAndErrors(p *Package, cover *TestCover) (pmain, ptest, pxtest *
 		*ptest = *p
 		ptest.Error = ptestErr
 		ptest.ForTest = p.ImportPath
-		if ptestImportsTesting {
-			ptest.Internal.TestinginitGo = formatTestinginit(p)
-		}
 		ptest.GoFiles = nil
 		ptest.GoFiles = append(ptest.GoFiles, p.GoFiles...)
 		ptest.GoFiles = append(ptest.GoFiles, p.TestGoFiles...)
@@ -211,9 +200,6 @@ func TestPackagesAndErrors(p *Package, cover *TestCover) (pmain, ptest, pxtest *
 				Ldflags:    p.Internal.Ldflags,
 				Gccgoflags: p.Internal.Gccgoflags,
 			},
-		}
-		if pxtestImportsTesting {
-			pxtest.Internal.TestinginitGo = formatTestinginit(pxtest)
 		}
 		if pxtestNeedsPtest {
 			pxtest.Internal.Imports = append(pxtest.Internal.Imports, ptest)
@@ -284,7 +270,7 @@ func TestPackagesAndErrors(p *Package, cover *TestCover) (pmain, ptest, pxtest *
 	// afterward that gathers t.Cover information.
 	t, err := loadTestFuncs(ptest)
 	if err != nil && pmain.Error == nil {
-		pmain.Error = &PackageError{Err: err.Error()}
+		pmain.setLoadPackageDataError(err, p.ImportPath, &stk)
 	}
 	t.Cover = cover
 	if len(ptest.GoFiles)+len(ptest.CgoFiles) > 0 {
@@ -335,9 +321,11 @@ func TestPackagesAndErrors(p *Package, cover *TestCover) (pmain, ptest, pxtest *
 
 	data, err := formatTestmain(t)
 	if err != nil && pmain.Error == nil {
-		pmain.Error = &PackageError{Err: err.Error()}
+		pmain.Error = &PackageError{Err: err}
 	}
-	pmain.Internal.TestmainGo = data
+	if data != nil {
+		pmain.Internal.TestmainGo = &data
+	}
 
 	return pmain, ptest, pxtest
 }
@@ -410,10 +398,13 @@ func recompileForTest(pmain, preal, ptest, pxtest *Package) {
 			}
 		}
 
-		// Don't compile build info from a main package. This can happen
-		// if -coverpkg patterns include main packages, since those packages
-		// are imported by pmain. See golang.org/issue/30907.
-		if p.Internal.BuildInfo != "" && p != pmain {
+		// Force main packages the test imports to be built as libraries.
+		// Normal imports of main packages are forbidden by the package loader,
+		// but this can still happen if -coverpkg patterns include main packages:
+		// covered packages are imported by pmain. Linking multiple packages
+		// compiled with '-p main' causes duplicate symbol errors.
+		// See golang.org/issue/30907, golang.org/issue/34114.
+		if p.Name == "main" && p != pmain && p != ptest {
 			split()
 		}
 	}
@@ -485,15 +476,6 @@ func loadTestFuncs(ptest *Package) (*testFuncs, error) {
 	return t, err
 }
 
-// formatTestinginit returns the content of the _testinginit.go file for p.
-func formatTestinginit(p *Package) []byte {
-	var buf bytes.Buffer
-	if err := testinginitTmpl.Execute(&buf, p); err != nil {
-		panic("testinginit template execution failed") // shouldn't be possible
-	}
-	return buf.Bytes()
-}
-
 // formatTestmain returns the content of the _testmain.go file for t.
 func formatTestmain(t *testFuncs) ([]byte, error) {
 	var buf bytes.Buffer
@@ -557,7 +539,7 @@ var testFileSet = token.NewFileSet()
 func (t *testFuncs) load(filename, pkg string, doImport, seen *bool) error {
 	f, err := parser.ParseFile(testFileSet, filename, nil, parser.ParseComments)
 	if err != nil {
-		return base.ExpandScanner(err)
+		return err
 	}
 	for _, d := range f.Decls {
 		n, ok := d.(*ast.FuncDecl)
@@ -623,31 +605,15 @@ func checkTestFunc(fn *ast.FuncDecl, arg string) error {
 	return nil
 }
 
-var testinginitTmpl = lazytemplate.New("init", `
-package {{.Name}}
-
-import _go_testing "testing"
-
-{{/*
-Call testing.Init before any other user initialization code runs.
-(This file is passed to the compiler first.)
-This provides the illusion of the old behavior where testing flags
-were registered as part of the testing package's initialization.
-*/}}
-var _ = func() bool {
-	_go_testing.Init()
-	return true
-}()
-`)
-
 var testmainTmpl = lazytemplate.New("main", `
 // Code generated by 'go test'. DO NOT EDIT.
 
 package main
 
 import (
-{{if not .TestMain}}
 	"os"
+{{if .TestMain}}
+	"reflect"
 {{end}}
 	"testing"
 	"testing/internal/testdeps"
@@ -738,6 +704,7 @@ func main() {
 	m := testing.MainStart(testdeps.TestDeps{}, tests, benchmarks, examples)
 {{with .TestMain}}
 	{{.Package}}.{{.Name}}(m)
+	os.Exit(int(reflect.ValueOf(m).Elem().FieldByName("exitCode").Int()))
 {{else}}
 	os.Exit(m.Run())
 {{end}}

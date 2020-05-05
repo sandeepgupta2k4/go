@@ -25,18 +25,6 @@ import (
 	"time"
 )
 
-func init() {
-	// TLS 1.3 cipher suites preferences are not configurable and change based
-	// on the architecture. Force them to the version with AES acceleration for
-	// test consistency.
-	once.Do(initDefaultCipherSuites)
-	varDefaultCipherSuitesTLS13 = []uint16{
-		TLS_AES_128_GCM_SHA256,
-		TLS_CHACHA20_POLY1305_SHA256,
-		TLS_AES_256_GCM_SHA384,
-	}
-}
-
 // Note: see comment in handshake_test.go for details of how the reference
 // tests work.
 
@@ -287,8 +275,6 @@ func (test *clientTest) loadData() (flows [][]byte, err error) {
 }
 
 func (test *clientTest) run(t *testing.T, write bool) {
-	checkOpenSSLVersion(t)
-
 	var clientConn, serverConn net.Conn
 	var recordingConn *recordingConn
 	var childProcess *exec.Cmd
@@ -450,12 +436,20 @@ func (test *clientTest) run(t *testing.T, write bool) {
 		}
 		for i, b := range flows {
 			if i%2 == 1 {
-				serverConn.SetWriteDeadline(time.Now().Add(1 * time.Minute))
+				if *fast {
+					serverConn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+				} else {
+					serverConn.SetWriteDeadline(time.Now().Add(1 * time.Minute))
+				}
 				serverConn.Write(b)
 				continue
 			}
 			bb := make([]byte, len(b))
-			serverConn.SetReadDeadline(time.Now().Add(1 * time.Minute))
+			if *fast {
+				serverConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			} else {
+				serverConn.SetReadDeadline(time.Now().Add(1 * time.Minute))
+			}
 			_, err := io.ReadFull(serverConn, bb)
 			if err != nil {
 				t.Fatalf("%s, flow %d: %s", test.name, i+1, err)
@@ -505,21 +499,15 @@ func peekError(conn net.Conn) error {
 }
 
 func runClientTestForVersion(t *testing.T, template *clientTest, version, option string) {
-	t.Run(version, func(t *testing.T) {
-		// Make a deep copy of the template before going parallel.
-		test := *template
-		if template.config != nil {
-			test.config = template.config.Clone()
-		}
+	// Make a deep copy of the template before going parallel.
+	test := *template
+	if template.config != nil {
+		test.config = template.config.Clone()
+	}
+	test.name = version + "-" + test.name
+	test.args = append([]string{option}, test.args...)
 
-		if !*update {
-			t.Parallel()
-		}
-
-		test.name = version + "-" + test.name
-		test.args = append([]string{option}, test.args...)
-		test.run(t, *update)
-	})
+	runTestAndUpdateIfNeeded(t, version, test.run, false)
 }
 
 func runClientTestTLS10(t *testing.T, template *clientTest) {
@@ -819,22 +807,26 @@ func TestHandshakeClientCertECDSA(t *testing.T) {
 	runClientTestTLS12(t, test)
 }
 
-// TestHandshakeClientCertRSAPSS tests a few separate things:
-//  * that our client can serve a PSS-signed certificate
-//  * that our client can validate a PSS-signed certificate
-//  * that our client can use rsa_pss_rsae_sha256 in its CertificateVerify
-//  * that our client can accpet rsa_pss_rsae_sha256 in the server CertificateVerify
+// TestHandshakeClientCertRSAPSS tests rsa_pss_rsae_sha256 signatures from both
+// client and server certificates. It also serves from both sides a certificate
+// signed itself with RSA-PSS, mostly to check that crypto/x509 chain validation
+// works.
 func TestHandshakeClientCertRSAPSS(t *testing.T) {
-	issuer, err := x509.ParseCertificate(testRSAPSSCertificate)
+	cert, err := x509.ParseCertificate(testRSAPSSCertificate)
 	if err != nil {
 		panic(err)
 	}
 	rootCAs := x509.NewCertPool()
-	rootCAs.AddCert(issuer)
+	rootCAs.AddCert(cert)
 
 	config := testConfig.Clone()
-	cert, _ := X509KeyPair([]byte(clientCertificatePEM), []byte(clientKeyPEM))
-	config.Certificates = []Certificate{cert}
+	// Use GetClientCertificate to bypass the client certificate selection logic.
+	config.GetClientCertificate = func(*CertificateRequestInfo) (*Certificate, error) {
+		return &Certificate{
+			Certificate: [][]byte{testRSAPSSCertificate},
+			PrivateKey:  testRSAPrivateKey,
+		}, nil
+	}
 	config.RootCAs = rootCAs
 
 	test := &clientTest{
@@ -845,7 +837,6 @@ func TestHandshakeClientCertRSAPSS(t *testing.T) {
 		cert:   testRSAPSSCertificate,
 		key:    testRSAPrivateKey,
 	}
-
 	runClientTestTLS12(t, test)
 	runClientTestTLS13(t, test)
 }
@@ -1757,7 +1748,7 @@ func TestHandshakeRace(t *testing.T) {
 
 		startWrite := make(chan struct{})
 		startRead := make(chan struct{})
-		readDone := make(chan struct{})
+		readDone := make(chan struct{}, 1)
 
 		client := Client(c, testConfig)
 		go func() {
@@ -1991,5 +1982,50 @@ func TestCloseClientConnectionOnIdleServer(t *testing.T) {
 		}
 	} else {
 		t.Errorf("Error expected, but no error returned")
+	}
+}
+
+func testDowngradeCanary(t *testing.T, clientVersion, serverVersion uint16) error {
+	defer func() { testingOnlyForceDowngradeCanary = false }()
+	testingOnlyForceDowngradeCanary = true
+
+	clientConfig := testConfig.Clone()
+	clientConfig.MaxVersion = clientVersion
+	serverConfig := testConfig.Clone()
+	serverConfig.MaxVersion = serverVersion
+	_, _, err := testHandshake(t, clientConfig, serverConfig)
+	return err
+}
+
+func TestDowngradeCanary(t *testing.T) {
+	if err := testDowngradeCanary(t, VersionTLS13, VersionTLS12); err == nil {
+		t.Errorf("downgrade from TLS 1.3 to TLS 1.2 was not detected")
+	}
+	if testing.Short() {
+		t.Skip("skipping the rest of the checks in short mode")
+	}
+	if err := testDowngradeCanary(t, VersionTLS13, VersionTLS11); err == nil {
+		t.Errorf("downgrade from TLS 1.3 to TLS 1.1 was not detected")
+	}
+	if err := testDowngradeCanary(t, VersionTLS13, VersionTLS10); err == nil {
+		t.Errorf("downgrade from TLS 1.3 to TLS 1.0 was not detected")
+	}
+	if err := testDowngradeCanary(t, VersionTLS12, VersionTLS11); err == nil {
+		t.Errorf("downgrade from TLS 1.2 to TLS 1.1 was not detected")
+	}
+	if err := testDowngradeCanary(t, VersionTLS12, VersionTLS10); err == nil {
+		t.Errorf("downgrade from TLS 1.2 to TLS 1.0 was not detected")
+	}
+	if err := testDowngradeCanary(t, VersionTLS13, VersionTLS13); err != nil {
+		t.Errorf("server unexpectedly sent downgrade canary for TLS 1.3")
+	}
+	if err := testDowngradeCanary(t, VersionTLS12, VersionTLS12); err != nil {
+		t.Errorf("client didn't ignore expected TLS 1.2 canary")
+	}
+	if err := testDowngradeCanary(t, VersionTLS11, VersionTLS11); err != nil {
+		t.Errorf("client unexpectedly reacted to a canary in TLS 1.1")
+	}
+	if err := testDowngradeCanary(t, VersionTLS10, VersionTLS10); err != nil {
+		t.Errorf("client unexpectedly reacted to a canary in TLS 1.0")
 	}
 }

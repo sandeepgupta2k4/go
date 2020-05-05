@@ -79,16 +79,6 @@ func isClosedChan(c <-chan struct{}) bool {
 	}
 }
 
-type timeoutError struct{}
-
-func (timeoutError) Error() string   { return "deadline exceeded" }
-func (timeoutError) Timeout() bool   { return true }
-func (timeoutError) Temporary() bool { return true }
-
-func (timeoutError) Is(target error) bool {
-	return target == os.ErrTemporary || target == os.ErrTimeout
-}
-
 type pipeAddr struct{}
 
 func (pipeAddr) Network() string { return "pipe" }
@@ -163,7 +153,7 @@ func (p *pipe) read(b []byte) (n int, err error) {
 	case isClosedChan(p.remoteDone):
 		return 0, io.EOF
 	case isClosedChan(p.readDeadline.wait()):
-		return 0, timeoutError{}
+		return 0, os.ErrDeadlineExceeded
 	}
 
 	select {
@@ -176,7 +166,7 @@ func (p *pipe) read(b []byte) (n int, err error) {
 	case <-p.remoteDone:
 		return 0, io.EOF
 	case <-p.readDeadline.wait():
-		return 0, timeoutError{}
+		return 0, os.ErrDeadlineExceeded
 	}
 }
 
@@ -195,7 +185,7 @@ func (p *pipe) write(b []byte) (n int, err error) {
 	case isClosedChan(p.remoteDone):
 		return 0, io.ErrClosedPipe
 	case isClosedChan(p.writeDeadline.wait()):
-		return 0, timeoutError{}
+		return 0, os.ErrDeadlineExceeded
 	}
 
 	p.wrMu.Lock() // Ensure entirety of b is written together
@@ -211,7 +201,7 @@ func (p *pipe) write(b []byte) (n int, err error) {
 		case <-p.remoteDone:
 			return n, io.ErrClosedPipe
 		case <-p.writeDeadline.wait():
-			return n, timeoutError{}
+			return n, os.ErrDeadlineExceeded
 		}
 	}
 	return n, nil

@@ -6,6 +6,7 @@ package main
 
 import (
 	"fmt"
+	"internal/obscuretestdata"
 	"internal/testenv"
 	"io/ioutil"
 	"os"
@@ -57,8 +58,8 @@ func TestNonGoExecs(t *testing.T) {
 	testfiles := []string{
 		"debug/elf/testdata/gcc-386-freebsd-exec",
 		"debug/elf/testdata/gcc-amd64-linux-exec",
-		"debug/macho/testdata/gcc-386-darwin-exec",
-		"debug/macho/testdata/gcc-amd64-darwin-exec",
+		"debug/macho/testdata/gcc-386-darwin-exec.base64",   // golang.org/issue/34986
+		"debug/macho/testdata/gcc-amd64-darwin-exec.base64", // golang.org/issue/34986
 		// "debug/pe/testdata/gcc-amd64-mingw-exec", // no symbols!
 		"debug/pe/testdata/gcc-386-mingw-exec",
 		"debug/plan9obj/testdata/amd64-plan9-exec",
@@ -67,6 +68,16 @@ func TestNonGoExecs(t *testing.T) {
 	}
 	for _, f := range testfiles {
 		exepath := filepath.Join(runtime.GOROOT(), "src", f)
+		if strings.HasSuffix(f, ".base64") {
+			tf, err := obscuretestdata.DecodeToTempFile(exepath)
+			if err != nil {
+				t.Errorf("obscuretestdata.DecodeToTempFile(%s): %v", exepath, err)
+				continue
+			}
+			defer os.Remove(tf)
+			exepath = tf
+		}
+
 		cmd := exec.Command(testnmpath, exepath)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -159,7 +170,7 @@ func testGoExec(t *testing.T, iscgo, isexternallinker bool) {
 				return true
 			}
 		}
-		if runtime.GOOS == "windows" && runtime.GOARCH == "arm" {
+		if runtime.GOOS == "windows" {
 			return true
 		}
 		return false
@@ -304,7 +315,7 @@ func testGoLib(t *testing.T, iscgo bool) {
 		}
 		for i := range syms {
 			sym := &syms[i]
-			if sym.Type == typ && sym.Name == name && sym.CSym == csym {
+			if sym.Type == typ && matchSymName(name, sym.Name) && sym.CSym == csym {
 				if sym.Found {
 					t.Fatalf("duplicate symbol %s %s", sym.Type, sym.Name)
 				}
@@ -321,6 +332,14 @@ func testGoLib(t *testing.T, iscgo bool) {
 
 func TestGoLib(t *testing.T) {
 	testGoLib(t, false)
+}
+
+// Check that a symbol has a given name, accepting both
+// new and old objects.
+// TODO(go115newobj): remove.
+func matchSymName(symname, want string) bool {
+	return symname == want ||
+		strings.HasPrefix(symname, want+"#") // new style, with index
 }
 
 const testexec = `

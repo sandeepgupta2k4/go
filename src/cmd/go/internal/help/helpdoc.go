@@ -21,8 +21,8 @@ http://swig.org/. When running go build, any file with a .swig
 extension will be passed to SWIG. Any file with a .swigcxx extension
 will be passed to SWIG with the -c++ option.
 
-When either cgo or SWIG is used, go build will pass any .c, .m, .s,
-or .S files to the C compiler, and any .cc, .cpp, .cxx files to the C++
+When either cgo or SWIG is used, go build will pass any .c, .m, .s, .S
+or .sx files to the C compiler, and any .cc, .cpp, .cxx files to the C++
 compiler. The CC or CXX environment variables may be set to determine
 the C or C++ compiler, respectively, to use.
 	`,
@@ -493,6 +493,9 @@ General-purpose environment variables:
 	GOCACHE
 		The directory where the go command will store cached
 		information for reuse in future builds.
+	GODEBUG
+		Enable various debugging facilities. See 'go doc runtime'
+		for details.
 	GOENV
 		The location of the Go environment configuration file.
 		Cannot be set using 'go env -w'.
@@ -503,6 +506,13 @@ General-purpose environment variables:
 		Because the entries are space-separated, flag values must
 		not contain spaces. Flags listed on the command line
 		are applied after this list and therefore override it.
+	GOINSECURE
+		Comma-separated list of glob patterns (in the syntax of Go's path.Match)
+		of module path prefixes that should always be fetched in an insecure
+		manner. Only applies to dependencies that are being fetched directly.
+		Unlike the -insecure flag on 'go get', GOINSECURE does not disable
+		checksum database validation. GOPRIVATE or GONOSUMDB may be used
+		to achieve that.
 	GOOS
 		The operating system for which to compile code.
 		Examples are linux, darwin, windows, netbsd.
@@ -510,19 +520,16 @@ General-purpose environment variables:
 		For more details see: 'go help gopath'.
 	GOPROXY
 		URL of Go module proxy. See 'go help modules'.
-	GONOPROXY
+	GOPRIVATE, GONOPROXY, GONOSUMDB
 		Comma-separated list of glob patterns (in the syntax of Go's path.Match)
-		of module path prefixes that should always be fetched directly, ignoring
-		the GOPROXY setting. See 'go help modules'.
+		of module path prefixes that should always be fetched directly
+		or that should not be compared against the checksum database.
+		See 'go help module-private'.
+	GOROOT
+		The root of the go tree.
 	GOSUMDB
 		The name of checksum database to use and optionally its public key and
 		URL. See 'go help module-auth'.
-	GONOSUMDB
-		Comma-separated list of glob patterns (in the syntax of Go's path.Match)
-		of module path prefixes that should not be compared against the checksum
-		database. See 'go help module-auth'.
-	GOROOT
-		The root of the go tree.
 	GOTMPDIR
 		The directory where the go command will write
 		temporary source files, packages, and binaries.
@@ -575,6 +582,9 @@ Architecture-specific environment variables:
 	GO386
 		For GOARCH=386, the floating point instruction set.
 		Valid values are 387, sse2.
+	GOAMD64
+		For GOARCH=amd64, jumps can be optionally be aligned such that they do not end on
+		or cross 32 byte boundaries.  Valid values are alignedjumps (default), normaljumps.
 	GOMIPS
 		For GOARCH=mips{,le}, whether to use floating point instructions.
 		Valid values are hardfloat (default), softfloat.
@@ -617,8 +627,10 @@ Additional information available from 'go env' but not read from the environment
 	GOHOSTOS
 		The operating system (GOOS) of the Go toolchain binaries.
 	GOMOD
-		The absolute path to the go.mod of the main module,
-		or the empty string if not using modules.
+		The absolute path to the go.mod of the main module.
+		If module-aware mode is enabled, but there is no go.mod, GOMOD will be
+		os.DevNull ("/dev/null" on Unix-like systems, "NUL" on Windows).
+		If module-aware mode is disabled, GOMOD will be the empty string.
 	GOTOOLDIR
 		The directory where the go tools (compile, cover, doc, etc...) are installed.
 	`,
@@ -645,7 +657,7 @@ the extension of the file name. These extensions are:
 	.m
 		Objective-C source files. Only useful with cgo, and always
 		compiled with the OS-native compiler.
-	.s, .S
+	.s, .S, .sx
 		Assembler source files.
 		If the package uses cgo or SWIG, these will be assembled with the
 		OS-native assembler (typically gcc (sic)); otherwise they
@@ -754,5 +766,62 @@ The output is voluminous but can be useful for debugging the cache.
 
 GODEBUG=gocachetest=1 causes the go command to print details of its
 decisions about whether to reuse a cached test result.
+`,
+}
+
+var HelpBuildConstraint = &base.Command{
+	UsageLine: "buildconstraint",
+	Short:     "build constraints",
+	Long: `
+Build constraints describe the conditions under which each source file
+should be included in the corresponding package. Build constraints
+for a given source file may be added by build constraint comments
+within the file, or by specific patterns in the file's name.
+
+A build constraint comment appears before the file's package clause and
+must be separated from the package clause by at least one blank line.
+The comment begins with:
+
+	// +build
+
+and follows with a space-separated list of options on the same line.
+The constraint is evaluated as the OR of the options.
+Each option evaluates as the AND of its comma-separated terms.
+Each term consists of letters, digits, underscores, and dots.
+Each term may be negated with a leading exclamation point.
+
+For example, the build constraint:
+
+	// +build linux,386 darwin,!cgo arm
+
+corresponds to boolean formula:
+
+	(linux AND 386) OR (darwin AND NOT cgo) OR arm
+
+During a particular build, the following terms are satisfied:
+- the target operating system and architecture, as spelled by
+  runtime.GOOS and runtime.GOARCH respectively
+- the compiler being used, either "gc" or "gccgo"
+- "cgo", if the cgo command is supported
+  (see CGO_ENABLED in 'go help environment')
+- a term for each Go major release, through the current version:
+  "go1.1" from Go version 1.1 onward,
+  "go1.2" from Go version 1.2 onward, and so on
+- and any additional tags given by the '-tags' flag (see 'go help build').
+
+An additional build constraint may be derived from the source file name.
+If a file's name, after stripping the extension and a possible _test suffix,
+matches the patterns *_GOOS, *_GOARCH, or *_GOOS_GOARCH for any known
+GOOS or GOARCH value, then the file is implicitly constrained to that
+specific GOOS and/or GOARCH, in addition to any other build constraints
+declared as comments within the file.
+
+For example, the file:
+
+	source_windows_amd64.go
+
+is implicitly constrained to windows / amd64.
+
+See 'go doc go/build' for more details.
 `,
 }

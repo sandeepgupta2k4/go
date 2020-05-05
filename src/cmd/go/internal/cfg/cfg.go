@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"fmt"
 	"go/build"
+	"internal/cfg"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -26,6 +27,7 @@ var (
 	BuildBuildmode         string // -buildmode flag
 	BuildContext           = defaultContext()
 	BuildMod               string             // -mod flag
+	BuildModReason         string             // reason -mod flag is set, if set by default
 	BuildI                 bool               // -i flag
 	BuildLinkshared        bool               // -linkshared flag
 	BuildMSan              bool               // -msan flag
@@ -42,6 +44,9 @@ var (
 	BuildV                 bool // -v flag
 	BuildWork              bool // -work flag
 	BuildX                 bool // -x flag
+
+	ModCacheRW bool   // -modcacherw flag
+	ModFile    string // -modfile flag
 
 	CmdName string // "build", "install", "list", "mod tidy", etc.
 
@@ -221,59 +226,8 @@ func Getenv(key string) string {
 
 // CanGetenv reports whether key is a valid go/env configuration key.
 func CanGetenv(key string) bool {
-	return strings.Contains(knownEnv, "\t"+key+"\n")
+	return strings.Contains(cfg.KnownEnv, "\t"+key+"\n")
 }
-
-var knownEnv = `
-	AR
-	CC
-	CGO_CFLAGS
-	CGO_CFLAGS_ALLOW
-	CGO_CFLAGS_DISALLOW
-	CGO_CPPFLAGS
-	CGO_CPPFLAGS_ALLOW
-	CGO_CPPFLAGS_DISALLOW
-	CGO_CXXFLAGS
-	CGO_CXXFLAGS_ALLOW
-	CGO_CXXFLAGS_DISALLOW
-	CGO_ENABLED
-	CGO_FFLAGS
-	CGO_FFLAGS_ALLOW
-	CGO_FFLAGS_DISALLOW
-	CGO_LDFLAGS
-	CGO_LDFLAGS_ALLOW
-	CGO_LDFLAGS_DISALLOW
-	CXX
-	FC
-	GCCGO
-	GO111MODULE
-	GO386
-	GOARCH
-	GOARM
-	GOBIN
-	GOCACHE
-	GOENV
-	GOEXE
-	GOFLAGS
-	GOGCCFLAGS
-	GOHOSTARCH
-	GOHOSTOS
-	GOMIPS
-	GOMIPS64
-	GONOPROXY
-	GONOSUMDB
-	GOOS
-	GOPATH
-	GOPPC64
-	GOPROXY
-	GOROOT
-	GOSUMDB
-	GOTMPDIR
-	GOTOOLDIR
-	GOWASM
-	GO_EXTLINK_ENABLED
-	PKG_CONFIG
-`
 
 var (
 	GOROOT       = BuildContext.GOROOT
@@ -282,38 +236,26 @@ var (
 	GOROOTpkg    = filepath.Join(GOROOT, "pkg")
 	GOROOTsrc    = filepath.Join(GOROOT, "src")
 	GOROOT_FINAL = findGOROOT_FINAL()
+	GOMODCACHE   = envOr("GOMODCACHE", gopathDir("pkg/mod"))
 
 	// Used in envcmd.MkEnv and build ID computations.
 	GOARM    = envOr("GOARM", fmt.Sprint(objabi.GOARM))
 	GO386    = envOr("GO386", objabi.GO386)
+	GOAMD64  = envOr("GOAMD64", objabi.GOAMD64)
 	GOMIPS   = envOr("GOMIPS", objabi.GOMIPS)
 	GOMIPS64 = envOr("GOMIPS64", objabi.GOMIPS64)
 	GOPPC64  = envOr("GOPPC64", fmt.Sprintf("%s%d", "power", objabi.GOPPC64))
 	GOWASM   = envOr("GOWASM", fmt.Sprint(objabi.GOWASM))
 
-	GOPROXY   = goproxy()
-	GOSUMDB   = gosumdb()
-	GONOPROXY = Getenv("GONOPROXY")
-	GONOSUMDB = Getenv("GONOSUMDB")
+	GOPROXY    = envOr("GOPROXY", "https://proxy.golang.org,direct")
+	GOSUMDB    = envOr("GOSUMDB", "sum.golang.org")
+	GOPRIVATE  = Getenv("GOPRIVATE")
+	GONOPROXY  = envOr("GONOPROXY", GOPRIVATE)
+	GONOSUMDB  = envOr("GONOSUMDB", GOPRIVATE)
+	GOINSECURE = Getenv("GOINSECURE")
 )
 
-func goproxy() string {
-	v := Getenv("GOPROXY")
-	if v != "" {
-		return v
-	}
-
-	return "https://proxy.golang.org,direct"
-}
-
-func gosumdb() string {
-	v := Getenv("GOSUMDB")
-	if v != "" {
-		return v
-	}
-
-	return "sum.golang.org"
-}
+var SumdbDir = gopathDir("pkg/sumdb")
 
 // GetArchEnv returns the name and setting of the
 // GOARCH-specific architecture environment variable.
@@ -325,6 +267,8 @@ func GetArchEnv() (key, val string) {
 		return "GOARM", GOARM
 	case "386":
 		return "GO386", GO386
+	case "amd64":
+		return "GOAMD64", GOAMD64
 	case "mips", "mipsle":
 		return "GOMIPS", GOMIPS
 	case "mips64", "mips64le":
@@ -425,4 +369,12 @@ func isGOROOT(path string) bool {
 		return false
 	}
 	return stat.IsDir()
+}
+
+func gopathDir(rel string) string {
+	list := filepath.SplitList(BuildContext.GOPATH)
+	if len(list) == 0 || list[0] == "" {
+		return ""
+	}
+	return filepath.Join(list[0], rel)
 }

@@ -2,26 +2,34 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//+build !plan9
+// +build !plan9
 
 package renameio
 
 import (
 	"encoding/binary"
 	"errors"
+	"internal/testenv"
 	"io/ioutil"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+
+	"cmd/go/internal/robustio"
 )
 
 func TestConcurrentReadsAndWrites(t *testing.T) {
+	if runtime.GOOS == "darwin" && strings.HasSuffix(testenv.Builder(), "-10_14") {
+		testenv.SkipFlaky(t, 33041)
+	}
+
 	dir, err := ioutil.TempDir("", "renameio")
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +66,7 @@ func TestConcurrentReadsAndWrites(t *testing.T) {
 			chunk := buf[offset*8 : (offset+chunkWords)*8]
 			if err := WriteFile(path, chunk, 0666); err == nil {
 				atomic.AddInt64(&writeSuccesses, 1)
-			} else if isEphemeralError(err) {
+			} else if robustio.IsEphemeralError(err) {
 				var (
 					errno syscall.Errno
 					dup   bool
@@ -74,10 +82,10 @@ func TestConcurrentReadsAndWrites(t *testing.T) {
 			}
 
 			time.Sleep(time.Duration(rand.Intn(100)) * time.Microsecond)
-			data, err := ioutil.ReadFile(path)
+			data, err := ReadFile(path)
 			if err == nil {
 				atomic.AddInt64(&readSuccesses, 1)
-			} else if isEphemeralError(err) {
+			} else if robustio.IsEphemeralError(err) {
 				var (
 					errno syscall.Errno
 					dup   bool
@@ -129,10 +137,18 @@ func TestConcurrentReadsAndWrites(t *testing.T) {
 	}
 
 	var minReadSuccesses int64 = attempts
-	if runtime.GOOS == "windows" {
+
+	switch runtime.GOOS {
+	case "windows":
 		// Windows produces frequent "Access is denied" errors under heavy rename load.
-		// As long as those are the only errors and *some* of the writes succeed, we're happy.
+		// As long as those are the only errors and *some* of the reads succeed, we're happy.
 		minReadSuccesses = attempts / 4
+
+	case "darwin":
+		// The filesystem on macOS 10.14 occasionally fails with "no such file or
+		// directory" errors. See https://golang.org/issue/33041. The flake rate is
+		// fairly low, so ensure that at least 75% of attempts succeed.
+		minReadSuccesses = attempts - (attempts / 4)
 	}
 
 	if readSuccesses < minReadSuccesses {

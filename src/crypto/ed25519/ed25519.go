@@ -40,6 +40,15 @@ const (
 // PublicKey is the type of Ed25519 public keys.
 type PublicKey []byte
 
+// Equal reports whether pub and x have the same value.
+func (pub PublicKey) Equal(x crypto.PublicKey) bool {
+	xx, ok := x.(PublicKey)
+	if !ok {
+		return false
+	}
+	return bytes.Equal(pub, xx)
+}
+
 // PrivateKey is the type of Ed25519 private keys. It implements crypto.Signer.
 type PrivateKey []byte
 
@@ -96,6 +105,13 @@ func GenerateKey(rand io.Reader) (PublicKey, PrivateKey, error) {
 // with RFC 8032. RFC 8032's private keys correspond to seeds in this
 // package.
 func NewKeyFromSeed(seed []byte) PrivateKey {
+	// Outline the function body so that the returned key can be stack-allocated.
+	privateKey := make([]byte, PrivateKeySize)
+	newKeyFromSeed(privateKey, seed)
+	return privateKey
+}
+
+func newKeyFromSeed(privateKey, seed []byte) {
 	if l := len(seed); l != SeedSize {
 		panic("ed25519: bad seed length: " + strconv.Itoa(l))
 	}
@@ -112,16 +128,21 @@ func NewKeyFromSeed(seed []byte) PrivateKey {
 	var publicKeyBytes [32]byte
 	A.ToBytes(&publicKeyBytes)
 
-	privateKey := make([]byte, PrivateKeySize)
 	copy(privateKey, seed)
 	copy(privateKey[32:], publicKeyBytes[:])
-
-	return privateKey
 }
 
 // Sign signs the message with privateKey and returns a signature. It will
 // panic if len(privateKey) is not PrivateKeySize.
 func Sign(privateKey PrivateKey, message []byte) []byte {
+	// Outline the function body so that the returned signature can be
+	// stack-allocated.
+	signature := make([]byte, SignatureSize)
+	sign(signature, privateKey, message)
+	return signature
+}
+
+func signGeneric(signature, privateKey, message []byte) {
 	if l := len(privateKey); l != PrivateKeySize {
 		panic("ed25519: bad private key length: " + strconv.Itoa(l))
 	}
@@ -161,16 +182,17 @@ func Sign(privateKey PrivateKey, message []byte) []byte {
 	var s [32]byte
 	edwards25519.ScMulAdd(&s, &hramDigestReduced, &expandedSecretKey, &messageDigestReduced)
 
-	signature := make([]byte, SignatureSize)
 	copy(signature[:], encodedR[:])
 	copy(signature[32:], s[:])
-
-	return signature
 }
 
 // Verify reports whether sig is a valid signature of message by publicKey. It
 // will panic if len(publicKey) is not PublicKeySize.
 func Verify(publicKey PublicKey, message, sig []byte) bool {
+	return verify(publicKey, message, sig)
+}
+
+func verifyGeneric(publicKey PublicKey, message, sig []byte) bool {
 	if l := len(publicKey); l != PublicKeySize {
 		panic("ed25519: bad public key length: " + strconv.Itoa(l))
 	}

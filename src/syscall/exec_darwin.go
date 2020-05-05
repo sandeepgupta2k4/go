@@ -13,12 +13,23 @@ type SysProcAttr struct {
 	Credential *Credential // Credential.
 	Ptrace     bool        // Enable tracing.
 	Setsid     bool        // Create session.
-	Setpgid    bool        // Set process group ID to Pgid, or, if Pgid == 0, to new pid.
-	Setctty    bool        // Set controlling terminal to fd Ctty
-	Noctty     bool        // Detach fd 0 from controlling terminal
-	Ctty       int         // Controlling TTY fd
-	Foreground bool        // Place child's process group in foreground. (Implies Setpgid. Uses Ctty as fd of controlling TTY)
-	Pgid       int         // Child's process group ID if Setpgid.
+	// Setpgid sets the process group ID of the child to Pgid,
+	// or, if Pgid == 0, to the new child's process ID.
+	Setpgid bool
+	// Setctty sets the controlling terminal of the child to
+	// file descriptor Ctty. Ctty must be a descriptor number
+	// in the child process: an index into ProcAttr.Files.
+	// This is only meaningful if Setsid is true.
+	Setctty bool
+	Noctty  bool // Detach fd 0 from controlling terminal
+	Ctty    int  // Controlling TTY fd
+	// Foreground places the child process group in the foreground.
+	// This implies Setpgid. The Ctty field must be set to
+	// the descriptor of the controlling TTY.
+	// Unlike Setctty, in this case Ctty must be a descriptor
+	// number in the parent process.
+	Foreground bool
+	Pgid       int // Child's process group ID if Setpgid.
 }
 
 // Implemented in runtime package.
@@ -80,8 +91,8 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 
 	// Enable tracing if requested.
 	if sys.Ptrace {
-		_, _, err1 = rawSyscall(funcPC(libc_ptrace_trampoline), uintptr(PTRACE_TRACEME), 0, 0)
-		if err1 != 0 {
+		if err := ptrace(PTRACE_TRACEME, 0, 0, 0); err != nil {
+			err1 = err.(Errno)
 			goto childerror
 		}
 	}
@@ -160,22 +171,6 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 		}
 	}
 
-	// Detach fd 0 from tty
-	if sys.Noctty {
-		_, _, err1 = rawSyscall(funcPC(libc_ioctl_trampoline), 0, uintptr(TIOCNOTTY), 0)
-		if err1 != 0 {
-			goto childerror
-		}
-	}
-
-	// Set the controlling TTY to Ctty
-	if sys.Setctty {
-		_, _, err1 = rawSyscall(funcPC(libc_ioctl_trampoline), uintptr(sys.Ctty), uintptr(TIOCSCTTY), 0)
-		if err1 != 0 {
-			goto childerror
-		}
-	}
-
 	// Pass 1: look for fd[i] < i and move those up above len(fd)
 	// so that pass 2 won't stomp on an fd it needs later.
 	if pipe < nextfd {
@@ -231,6 +226,22 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 	// to set them close-on-exec.
 	for i = len(fd); i < 3; i++ {
 		rawSyscall(funcPC(libc_close_trampoline), uintptr(i), 0, 0)
+	}
+
+	// Detach fd 0 from tty
+	if sys.Noctty {
+		_, _, err1 = rawSyscall(funcPC(libc_ioctl_trampoline), 0, uintptr(TIOCNOTTY), 0)
+		if err1 != 0 {
+			goto childerror
+		}
+	}
+
+	// Set the controlling TTY to Ctty
+	if sys.Setctty {
+		_, _, err1 = rawSyscall(funcPC(libc_ioctl_trampoline), uintptr(sys.Ctty), uintptr(TIOCSCTTY), 0)
+		if err1 != 0 {
+			goto childerror
+		}
 	}
 
 	// Time to exec.
